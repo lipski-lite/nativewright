@@ -37,6 +37,7 @@ const POSITIONAL = {
   get:          ['selector', 'attr'],
   count:        ['selector'],
   eval:         ['js'],
+  'eval-file':  ['path'],
   cookies:      ['url'],
   frame:        ['name'],
   dialog:       ['action', 'promptText'],

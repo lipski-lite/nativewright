@@ -370,6 +370,27 @@ const commands = {
     return { value: value === undefined ? null : value };
   },
 
+  // Read a JS file from disk and evaluate its FULL contents as ONE expression in
+  // the page's evaluate context. Unlike `eval` (which carries JS as a CLI arg,
+  // capped by the OS command-line length limit ~32KB), this reads the file
+  // in-process, so a large self-contained script (e.g. the ~550KB axe-core
+  // source + an axe.run() call wrapped in one async IIFE) is injected AND run in
+  // a single evaluate call. That single-call requirement matters because
+  // Patchright runs evaluate in an isolated world: a library defined by a
+  // separate <script>/evaluate is invisible to later evaluate calls, so it must
+  // be defined and used within the same evaluate. CDP evaluate also bypasses
+  // page CSP, so this works on sites that block injected <script> tags.
+  // The file MUST be a single self-contained JS expression (e.g. an async IIFE).
+  async 'eval-file'(session, args) {
+    if (!args.path) throw new Error('path required');
+    const page = requirePage(session);
+    const abs = path.resolve(args.path);
+    if (!fs.existsSync(abs)) throw new Error(`file not found: ${abs}`);
+    const code = fs.readFileSync(abs, 'utf8');
+    const value = await page.evaluate(code);
+    return { value: value === undefined ? null : value };
+  },
+
   async cookies(session, args) {
     const context = session.context();
     const urls = args.url ? [args.url] : undefined;

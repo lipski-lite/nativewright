@@ -132,6 +132,23 @@ test('daemon boots, commands roundtrip, stops cleanly', async (t) => {
   const { size } = fs.statSync(pngPath);
   assert.ok(size > 1000, `screenshot suspiciously small: ${size} bytes`);
 
+  // 3d-bis. eval-file: read a JS file from disk and evaluate its full contents
+  // in the page context (the path that injects large libs past the CLI arg limit).
+  const efScript = path.join(TMP_ARTIFACTS, 'evalfile-probe.js');
+  fs.writeFileSync(efScript, '(async () => { return { two: 1 + 1, title: document.title }; })()');
+  const ef = cli(['eval-file', efScript]);
+  assert.strictEqual(ef.exitCode, 0,
+    `eval-file failed: ${JSON.stringify(ef.body)}\nstderr: ${ef.stderr}`);
+  assert.strictEqual(ef.body.ok, true);
+  assert.strictEqual(ef.body.result.value.two, 2, 'eval-file did not evaluate the expression');
+  assert.match(ef.body.result.value.title, /Example Domain/i,
+    'eval-file did not run in the page context');
+
+  // 3d-ter. eval-file on a missing file -> ok:false, daemon stays alive.
+  const efMissing = cli(['eval-file', path.join(TMP_ARTIFACTS, 'nope.js')]);
+  assert.strictEqual(efMissing.exitCode, 1);
+  assert.strictEqual(efMissing.body.ok, false);
+
   // 3e. unknown command -> daemon stays alive, ok:false
   const bad = cli(['does-not-exist']);
   assert.strictEqual(bad.exitCode, 1);
