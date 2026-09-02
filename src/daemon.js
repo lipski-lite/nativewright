@@ -2,13 +2,37 @@
 
 /**
  * The long-running browser daemon. Owns a single Patchright
- * `BrowserContext`, maintains a registry of pages, wires per-page
- * event buffers, and exposes a tiny JSON-over-HTTP command surface
- * on `127.0.0.1:<ephemeral port>`.
+ * `BrowserContext`, keeps a registry of pages keyed by STABLE ids, gives
+ * every page its own queue and its own window, and exposes a tiny
+ * JSON-over-HTTP command surface on `127.0.0.1:<ephemeral port>`.
  *
- * The daemon is intentionally single-process, single-context. Spawn
- * multiple daemons only if you also use distinct `NATIVEWRIGHT_HOME`
- * roots to avoid lockfile collisions.
+ * Concurrency model — safe for any number of clients at once:
+ *
+ *   • There is NO shared "active page". A page-targeting request names its
+ *     page (`--page=<id>`) and the daemon binds the command to that page
+ *     inside that page's own serialized queue. Nothing two clients touch is
+ *     shared mutable state, so they cannot clobber each other.
+ *   • Page ids are stable for the page's lifetime (p1, p2, …) and are never
+ *     re-indexed when another page closes.
+ *   • Frame scope, dialog policy and console/network/download buffers are
+ *     all per page.
+ *   • Commands on different pages run concurrently; commands on the same
+ *     page are serialized. Pageless commands use a meta queue.
+ *   • Each `new` page opens in its OWN WINDOW (Target.createTarget with
+ *     newWindow). A page in its own window stays a foreground page
+ *     (visibilityState 'visible', timers and rAF running) even when other
+ *     windows overlap it; background TABS in a shared window are hidden and
+ *     throttled, which breaks animations, observers, lazy-loading and
+ *     screenshots.
+ *   • Lifecycle is lease-based: clients `close` their page when done. The
+ *     daemon idle-exits gracefully (flushing the profile) after the last
+ *     page has been closed for IDLE_EXIT_MS. `stop` refuses while pages are
+ *     live unless forced. A minimized internal keeper window keeps Chromium
+ *     alive between leases (Chromium exits when its last window closes).
+ *
+ * One daemon serves one profile (identity). Distinct identities need
+ * distinct profiles → distinct daemons via separate `NATIVEWRIGHT_HOME`
+ * roots (the lockfile lives under the root).
  *
  * @module daemon
  */
@@ -17,10 +41,10 @@ const http = require('http');
 const { chromium } = require('patchright');
 
 const cfg = require('./config');
-const { commands } = require('./commands');
+const { commands, PAGELESS } = require('./commands');
 
-// In-page hook that survives Patchright's stealth-driven suppression of
-// `Runtime.enable` / `Console.enable`. Re-injected after every navigation.
+// In-page hook that survives Patchright's suppression of `Runtime.enable` /
+// `Console.enable`. Re-injected after every navigation.
 const CONSOLE_INIT_SOURCE = `
   (() => {
     if (window.__nativewright_console__) return 'already';
@@ -48,71 +72,85 @@ const CONSOLE_INIT_SOURCE = `
   })();
 `;
 
-/**
- * @typedef {Object} PageRecord
- * @property {import('patchright').Page} page
- * @property {Array<{at:string,type:string,text:string}>} console
- * @property {Array<Object>} network
- * @property {Array<Object>} downloads
- */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * @typedef {Object} CommandLogEntry
- * @property {string} at   ISO timestamp
- * @property {string} cmd
- * @property {Object} args
- * @property {boolean} ok
- * @property {number} durMs
- * @property {string} [error]
- */
+/** Truthy env flag under either accepted prefix. */
+function envFlag(suffix) {
+  return /^(1|true|yes|on)$/i.test(cfg.envAny(suffix));
+}
 
-/**
- * In-memory session state shared across the HTTP handlers.
- * Not exported directly — constructed by {@link runDaemon}.
- * @returns {Object} session object with bound helpers
- */
+/** Serialize async work: each queue runs its jobs strictly one at a time. */
+function makeQueue() {
+  let chain = Promise.resolve();
+  return function enqueue(fn) {
+    const next = chain.then(() => fn(), () => fn());
+    chain = next.catch(() => {});
+    return next;
+  };
+}
+
+// ---------- session state ---------------------------------------------------
+
 function createSession() {
-  /** @type {PageRecord[]} */
-  const pages = [];
-  let activeIndex = -1;
-  let currentFrameRef = null;      // { type: 'name'|'index', value }
-  let dialogPolicy = { action: 'dismiss', promptText: undefined };
+  const pages = new Map();              // id -> rec
+  let nextId = 1;
+  let windowSlot = 0;
   let _context = null;
+  let _browserCdp = null;
   let _consoleInit = null;
-  /** @type {CommandLogEntry[]} */
+  let _keeper = null;
+  let _shutdown = null;
+  let idleTimer = null;
   const commandLog = [];
   const startedAt = new Date().toISOString();
-
-  function adoptPage(page) {
-    if (pages.some((r) => r.page === page)) return pages.findIndex((r) => r.page === page);
-    const rec = { page, console: [], network: [], downloads: [] };
-    pages.push(rec);
-    wirePage(rec);
-    ensureConsoleHook(page).catch(() => {});
-    if (activeIndex < 0) activeIndex = pages.length - 1;
-    return pages.length - 1;
-  }
+  const metaQueue = makeQueue();
 
   async function ensureConsoleHook(page) {
     if (!_consoleInit) return;
     try { await page.evaluate(_consoleInit); } catch { /* page may not be ready */ }
   }
 
+  function findRec(page) {
+    for (const r of pages.values()) if (r.page === page) return r;
+    return null;
+  }
+
+  function adoptPage(page, meta = {}) {
+    const existing = findRec(page);
+    if (existing) return existing;
+    const id = 'p' + (nextId++);
+    const rec = {
+      id, page,
+      label: meta.label || null,
+      opener: meta.opener || null,
+      cwd: meta.cwd || null,
+      createdAt: new Date().toISOString(),
+      windowId: null,
+      console: [], network: [], downloads: [],
+      frameRef: null,
+      dialogPolicy: { action: 'dismiss', promptText: undefined },
+      queue: makeQueue(),
+    };
+    pages.set(id, rec);
+    wirePage(rec);
+    ensureConsoleHook(page).catch(() => {});
+    cfg.appendLog(`[${id}] page adopted` +
+      (rec.label ? ` label=${rec.label}` : '') +
+      (rec.opener ? ` opener=${rec.opener}` : ''));
+    onPagesChanged();
+    return rec;
+  }
+
   function wirePage(rec) {
     const { page } = rec;
-    // NOTE: page.on('console') and page.on('pageerror') do NOT fire under
-    // Patchright (stealth suppresses CDP Runtime/Console domains). Console
-    // messages are captured via the in-page hook re-injected after every
-    // navigation — see ensureConsoleHook. Dialog / download / request /
-    // response still work because they use different CDP domains.
     page.on('framenavigated', (frame) => {
       if (frame === page.mainFrame()) ensureConsoleHook(page).catch(() => {});
     });
     page.on('dialog', async (dialog) => {
       try {
-        if (dialogPolicy.action === 'accept') await dialog.accept(dialogPolicy.promptText || undefined);
+        if (rec.dialogPolicy.action === 'accept') await dialog.accept(rec.dialogPolicy.promptText || undefined);
         else await dialog.dismiss();
-      } catch (e) { cfg.appendLog(`dialog handler error: ${e.message}`); }
+      } catch (e) { cfg.appendLog(`[${rec.id}] dialog handler error: ${e.message}`); }
     });
     page.on('download', async (dl) => {
       const entry = {
@@ -126,16 +164,16 @@ function createSession() {
       while (rec.downloads.length > 50) rec.downloads.shift();
       try {
         const path = require('path');
-        const dir = cfg.artifactsDir();
+        const dir = cfg.artifactsDir(rec.cwd);
         cfg.ensureDir(dir);
         const safe = (dl.suggestedFilename() || 'download').replace(/[^a-zA-Z0-9_.-]/g, '_');
         const target = path.join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}-${safe}`);
         await dl.saveAs(target);
         entry.path = target;
-        cfg.appendLog(`download saved ${target}`);
+        cfg.appendLog(`[${rec.id}] download saved ${target}`);
       } catch (e) {
         entry.error = e.message;
-        cfg.appendLog(`download failed: ${e.message}`);
+        cfg.appendLog(`[${rec.id}] download failed: ${e.message}`);
       }
     });
     page.on('request', (req) => {
@@ -153,95 +191,140 @@ function createSession() {
       while (rec.network.length > 100) rec.network.shift();
     });
     page.on('close', () => {
-      const i = pages.indexOf(rec);
-      if (i < 0) return;
-      pages.splice(i, 1);
-      if (activeIndex === i) activeIndex = pages.length ? 0 : -1;
-      else if (activeIndex > i) activeIndex -= 1;
-      if (activeIndex < 0) currentFrameRef = null;
+      if (pages.get(rec.id) === rec) pages.delete(rec.id);
+      cfg.appendLog(`[${rec.id}] page closed (${pages.size} remaining)`);
+      onPagesChanged();
     });
   }
 
-  async function newPage() {
-    if (!_context) throw new Error('context not ready');
-    const page = await _context.newPage();
-    adoptPage(page);
-    activeIndex = pages.length - 1;
-    return page;
+  // ---- window helpers via a short-lived CDP session on the page ----------
+
+  async function withPageCdp(page, fn) {
+    const s = await _context.newCDPSession(page);
+    try { return await fn(s); }
+    finally { await s.detach().catch(() => {}); }
   }
 
-  function pageIndex(page)      { return pages.findIndex((r) => r.page === page); }
-  function activePage()         { return activeIndex >= 0 ? pages[activeIndex].page : null; }
-  function activeRec()          { return activeIndex >= 0 ? pages[activeIndex] : null; }
-  function activeIdx()          { return activeIndex; }
+  async function setWindowBounds(page, bounds) {
+    return withPageCdp(page, async (s) => {
+      const { windowId } = await s.send('Browser.getWindowForTarget');
+      await s.send('Browser.setWindowBounds', { windowId, bounds });
+      return windowId;
+    });
+  }
 
-  function setActivePage(i) {
-    if (!Number.isInteger(i) || i < 0 || i >= pages.length) {
-      throw new Error(`no page at index ${i} (have ${pages.length})`);
+  async function windowIdOf(page) {
+    try {
+      return await withPageCdp(page, async (s) => (await s.send('Browser.getWindowForTarget')).windowId);
+    } catch { return null; }
+  }
+
+  /**
+   * Open a page in its own window (falls back to a tab if the browser-level
+   * CDP session is unavailable). Cascades windows so a person sees them apart.
+   */
+  async function newPage(opts = {}) {
+    if (!_context) throw new Error('context not ready');
+    const before = new Set(_context.pages());
+    let page = null;
+    if (opts.window !== false && _browserCdp) {
+      try {
+        await _browserCdp.send('Target.createTarget', { url: 'about:blank', newWindow: true });
+        for (let i = 0; i < 80 && !page; i++) {
+          await sleep(50);
+          page = _context.pages().find((p) => !before.has(p)) || null;
+        }
+        if (!page) cfg.appendLog('createTarget(newWindow) produced no page in time; falling back to a tab');
+      } catch (e) {
+        cfg.appendLog(`createTarget(newWindow) failed, falling back to a tab: ${e.message}`);
+        page = null;
+      }
     }
-    activeIndex = i;
-    currentFrameRef = null;
+    if (!page) page = await _context.newPage();
+    const rec = adoptPage(page, { label: opts.label, cwd: opts.cwd });
+    if (opts.label != null && !rec.label) rec.label = opts.label;
+    if (opts.cwd && !rec.cwd) rec.cwd = opts.cwd;
+    try {
+      const k = (windowSlot++) % 8;
+      rec.windowId = await setWindowBounds(page, {
+        left: 40 + k * 56, top: 40 + k * 44, width: 1180, height: 820, windowState: 'normal',
+      });
+    } catch {
+      rec.windowId = await windowIdOf(page);
+    }
+    return rec;
+  }
+
+  /**
+   * Resolve the page a request targets. An explicit --page wins; a lone page
+   * is unambiguous; anything else is refused rather than guessed — a guess is
+   * exactly how one client would end up driving another client's page.
+   */
+  function resolve(args) {
+    const ids = [...pages.keys()];
+    if (args && args.page != null && args.page !== '') {
+      const rec = pages.get(String(args.page));
+      if (!rec) throw new Error(`no page '${args.page}' (open pages: ${ids.length ? ids.join(', ') : 'none'})`);
+      return rec;
+    }
+    if (pages.size === 1) return pages.values().next().value;
+    if (pages.size === 0) throw new Error('no pages open — run `new` first (it returns the id to pass as --page=<id>)');
+    throw new Error(
+      `${pages.size} pages are open (${ids.join(', ')}); pass --page=<id>. ` +
+      'Ambiguous targeting is refused so clients never drive each other\'s page.'
+    );
+  }
+
+  function frameOf(rec) {
+    if (!rec.frameRef) return null;
+    const { type, value } = rec.frameRef;
+    if (type === 'name') return rec.page.frame({ name: value }) || null;
+    if (type === 'index') { const frames = rec.page.frames(); return frames[value] || null; }
+    return null;
   }
 
   function listPages() {
-    return pages.map((r, i) => ({
-      index: i, active: i === activeIndex, url: r.page.url(),
+    return [...pages.values()].map((r) => ({
+      page: r.id,
+      label: r.label,
+      url: r.page.url(),
+      windowId: r.windowId,
+      opener: r.opener,
+      cwd: r.cwd,
+      createdAt: r.createdAt,
     }));
   }
 
-  async function closeActivePage() {
-    const rec = activeRec();
-    if (!rec) throw new Error('no active page');
+  async function closePage(rec) {
     await rec.page.close();
-    return { closed: true };
+    return { closed: rec.id, remaining: pages.size };
   }
 
-  function activeFrame() {
-    const page = activePage();
-    if (!page || !currentFrameRef) return null;
-    if (currentFrameRef.type === 'name') {
-      return page.frame({ name: currentFrameRef.value }) || null;
+  function onPagesChanged() {
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    if (pages.size === 0 && cfg.IDLE_EXIT_MS > 0 && _shutdown) {
+      idleTimer = setTimeout(() => {
+        cfg.appendLog(`no pages for ${cfg.IDLE_EXIT_MS}ms — idle exit`);
+        _shutdown(0);
+      }, cfg.IDLE_EXIT_MS);
     }
-    if (currentFrameRef.type === 'index') {
-      const frames = page.frames();
-      return frames[currentFrameRef.value] || null;
-    }
-    return null;
   }
-  function setFrameByName(name)  { currentFrameRef = { type: 'name',  value: name  }; }
-  function setFrameByIndex(idx)  { currentFrameRef = { type: 'index', value: idx   }; }
-  function clearFrame()          { currentFrameRef = null; }
 
-  function setDialogPolicy(p)    { dialogPolicy = { action: p.action, promptText: p.promptText }; }
-
-  function consoleBuffer(n) {
-    const rec = activeRec(); if (!rec) return [];
-    return rec.console.slice(-n);
-  }
-  function appendConsole(entries) {
-    const rec = activeRec(); if (!rec) return;
-    for (const e of entries) rec.console.push(e);
-    while (rec.console.length > 200) rec.console.shift();
-  }
-  function networkBuffer(n) {
-    const rec = activeRec(); if (!rec) return [];
-    return rec.network.slice(-n);
-  }
-  function downloadsBuffer(n) {
-    const rec = activeRec(); if (!rec) return [];
-    return rec.downloads.slice(-n);
+  /** The initial launch page keeps Chromium alive between leases. Never listed. */
+  async function setupKeeper(page) {
+    _keeper = page;
+    try { await setWindowBounds(page, { windowState: 'minimized' }); } catch { /* best effort (headless) */ }
   }
 
   function snapshot() {
     return {
       startedAt,
-      activeIndex,
-      pageCount: pages.length,
-      pages: pages.map((r, i) => ({ index: i, url: r.page.url() })),
-      frame: currentFrameRef,
-      dialogPolicy,
+      pageCount: pages.size,
+      pages: listPages(),
+      keeper: !!_keeper && !_keeper.isClosed(),
+      idleExitMs: cfg.IDLE_EXIT_MS,
+      idleTimerArmed: !!idleTimer,
       userDataDir: cfg.userDataDir(),
-      artifactsDir: cfg.artifactsDir(),
       commandLog: commandLog.slice(-20),
     };
   }
@@ -254,32 +337,18 @@ function createSession() {
   return {
     context() { return _context; },
     setContext(c) { _context = c; },
+    setBrowserCdp(s) { _browserCdp = s; },
     setConsoleInit(src) { _consoleInit = src; },
+    setShutdown(fn) { _shutdown = fn; onPagesChanged(); },
     ensureConsoleHook,
-    adoptPage,
-    newPage, pageIndex, activePage, activeIndex: activeIdx,
-    setActivePage, listPages, closeActivePage,
-    activeFrame, setFrameByName, setFrameByIndex, clearFrame,
-    setDialogPolicy,
-    consoleBuffer, appendConsole, networkBuffer, downloadsBuffer,
-    snapshot, logCommand,
-    pages: () => pages,
+    adoptPage, findRec, newPage, resolve, frameOf, listPages, closePage,
+    setupKeeper, metaQueue, snapshot, logCommand,
+    pageCount: () => pages.size,
+    pageIds: () => [...pages.keys()],
   };
 }
 
-// ---------- HTTP helpers --------------------------------------------------
-
-/**
- * Strip ANSI escape sequences (Playwright error messages are decorated
- * with them; clients get cleaner JSON without).
- * @param {string} s
- * @returns {string}
- */
-function stripAnsi(s) {
-  return typeof s === 'string'
-    ? s.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '')
-    : s;
-}
+// ---------- HTTP helpers ----------------------------------------------------
 
 function jsonBody(req) {
   return new Promise((resolve, reject) => {
@@ -294,6 +363,14 @@ function jsonBody(req) {
   });
 }
 
+// Strip ANSI escape sequences (Playwright error messages are decorated with
+// them; clients get cleaner JSON without).
+function stripAnsi(s) {
+  return typeof s === 'string'
+    ? s.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '')
+    : s;
+}
+
 function send(res, code, obj) {
   const body = Buffer.from(JSON.stringify(obj), 'utf8');
   res.writeHead(code, {
@@ -303,35 +380,13 @@ function send(res, code, obj) {
   res.end(body);
 }
 
-/**
- * Serialize command execution so the daemon never has two commands
- * touching the page state at the same moment.
- * @returns {(fn: () => Promise<any>) => Promise<any>}
- */
-function makeQueue() {
-  let chain = Promise.resolve();
-  return function enqueue(fn) {
-    const next = chain.then(() => fn(), () => fn());
-    chain = next.catch(() => {});
-    return next;
-  };
-}
+// ---------- daemon entry ----------------------------------------------------
 
-// ---------- daemon entry --------------------------------------------------
-
-/**
- * Boot the daemon. Never returns until the process is asked to shut down
- * via `POST /shutdown` or an OS signal.
- *
- * @param {{scriptPath: string}} opts
- * @returns {Promise<never>}
- */
 async function runDaemon({ scriptPath }) {
   cfg.ensureDir(cfg.ROOT_DIR);
   cfg.ensureDir(cfg.LOG_DIR);
   cfg.ensureDir(cfg.userDataDir());
 
-  // Preflight: reap stale lockfiles from crashed daemons.
   const existing = await cfg.readLockfile();
   if (existing) {
     const alive = await cfg.verifyLockfile(existing);
@@ -350,9 +405,9 @@ async function runDaemon({ scriptPath }) {
   session.setConsoleInit(CONSOLE_INIT_SOURCE);
 
   // ---- launch browser ----------------------------------------------------
-  cfg.appendLog(`daemon starting; userDataDir=${cfg.userDataDir()}`);
-  const headless = envFlag('NATIVEWRIGHT_HEADLESS');
-  const channel  = process.env.NATIVEWRIGHT_CHANNEL || 'chrome';
+  cfg.appendLog(`daemon starting; userDataDir=${cfg.userDataDir()} idleExitMs=${cfg.IDLE_EXIT_MS}`);
+  const headless = envFlag('HEADLESS');
+  const channel  = cfg.envAny('CHANNEL') || 'chrome';
 
   /** @type {import('patchright').LaunchOptions} */
   const launchOpts = {
@@ -364,22 +419,19 @@ async function runDaemon({ scriptPath }) {
 
   // Strip --no-sandbox from Patchright's default args unless we're in an
   // environment that genuinely needs it (root Linux / Docker, where the
-  // kernel-level sandbox is unavailable and Chrome won't start without this
-  // flag). Default-off matters because:
-  //   1. Chrome shows a yellow warning bar in every window when it's set.
-  //   2. It's a bot-telltale fingerprinted by anti-bot systems.
-  //   3. It disables the renderer sandbox (security regression).
+  // kernel-level sandbox is unavailable and Chrome won't start without the
+  // flag). Default-off keeps the renderer sandbox on and avoids Chrome's
+  // warning bar.
   const isRootLinux = process.platform === 'linux'
     && typeof process.getuid === 'function' && process.getuid() === 0;
-  const keepNoSandbox = isRootLinux || envFlag('NATIVEWRIGHT_ALLOW_NO_SANDBOX');
+  const keepNoSandbox = isRootLinux || envFlag('ALLOW_NO_SANDBOX');
   if (!keepNoSandbox) {
     launchOpts.ignoreDefaultArgs = ['--no-sandbox'];
   }
 
   // Only pass an explicit executablePath when the user didn't ask us to
-  // skip discovery (useful on CI where we want to let Patchright resolve
-  // the bundled chromium).
-  if (!envFlag('NATIVEWRIGHT_NO_EXEC_PATH')) {
+  // skip discovery (useful on CI where Patchright resolves bundled Chromium).
+  if (!envFlag('NO_EXEC_PATH')) {
     const exe = cfg.chromeExecutable();
     if (exe) launchOpts.executablePath = exe;
   }
@@ -394,42 +446,95 @@ async function runDaemon({ scriptPath }) {
   }
   session.setContext(context);
 
-  for (const page of context.pages()) session.adoptPage(page);
-  context.on('page', (page) => session.adoptPage(page));
+  // Browser-level CDP session: needed to open each page in its own window.
+  try {
+    const b = context.browser();
+    if (b && typeof b.newBrowserCDPSession === 'function') {
+      session.setBrowserCdp(await b.newBrowserCDPSession());
+    } else {
+      cfg.appendLog('browser-level CDP session unavailable; new pages will open as tabs');
+    }
+  } catch (e) {
+    cfg.appendLog(`browser-level CDP session failed: ${e.message}; new pages will open as tabs`);
+  }
+
+  // The initial page becomes the keeper; any extra initial pages are adopted.
+  const initial = context.pages();
+  if (initial.length) await session.setupKeeper(initial[0]);
+  for (const p of initial.slice(1)) session.adoptPage(p);
+
+  // Pages the daemon didn't create itself (popups, window.open, a person
+  // opening a tab) are adopted too, tagged with their opener when known.
+  context.on('page', (page) => {
+    (async () => {
+      let openerId = null, cwd = null;
+      try {
+        const op = await page.opener();
+        const orec = op ? session.findRec(op) : null;
+        if (orec) { openerId = orec.id; cwd = orec.cwd; }
+      } catch { /* ignore */ }
+      session.adoptPage(page, { opener: openerId, cwd });
+    })();
+  });
 
   // ---- http server -------------------------------------------------------
-
-  const enqueue = makeQueue();
 
   const server = http.createServer(async (req, res) => {
     try {
       if (req.method === 'GET' && req.url === '/ping') return send(res, 200, { ok: true, pong: true });
+
       if (req.method === 'POST' && req.url === '/shutdown') {
-        send(res, 200, { ok: true });
+        const body = await jsonBody(req).catch(() => ({}));
+        const n = session.pageCount();
+        if (n > 0 && !body.force) {
+          return send(res, 200, {
+            ok: false,
+            error: `${n} page(s) still open (${session.pageIds().join(', ')}) — close them, or stop --force to shut down anyway`,
+            pages: session.pageIds(),
+          });
+        }
+        send(res, 200, { ok: true, forced: !!body.force, closedPages: n });
         setTimeout(() => shutdown(0), 20);
         return;
       }
+
       if (req.method === 'POST' && req.url === '/cmd') {
         const body = await jsonBody(req);
         const cmd = body && body.cmd;
         const args = (body && body.args) || {};
+        const cwd = (body && body.cwd) || null;
         const handler = commands[cmd];
         if (!handler) return send(res, 400, { ok: false, error: `unknown command: ${cmd}` });
         const startedMs = Date.now();
+        let targetId = null;
         try {
-          const result = await enqueue(() => handler(session, args));
+          let result;
+          if (PAGELESS.has(cmd)) {
+            result = await session.metaQueue(() => handler({ session, cwd }, args));
+          } else {
+            const rec = session.resolve(args);
+            targetId = rec.id;
+            // The ctx is built when the job RUNS (inside this page's queue), so
+            // the frame scope reflects any earlier `frame` command on the page.
+            result = await rec.queue(() => handler({
+              session, rec, page: rec.page,
+              scope: session.frameOf(rec) || rec.page,
+              cwd: cwd || rec.cwd,
+            }, args));
+          }
           const durMs = Date.now() - startedMs;
-          session.logCommand({ at: new Date().toISOString(), cmd, args, ok: true, durMs });
-          cfg.appendLog(`${cmd} ok ${durMs}ms`);
-          return send(res, 200, { ok: true, result });
+          session.logCommand({ at: new Date().toISOString(), cmd, page: targetId, args, ok: true, durMs });
+          cfg.appendLog(`${targetId ? `[${targetId}] ` : ''}${cmd} ok ${durMs}ms`);
+          return send(res, 200, { ok: true, page: targetId, result });
         } catch (e) {
           const durMs = Date.now() - startedMs;
           const cleanMsg = stripAnsi(e.message || String(e));
-          session.logCommand({ at: new Date().toISOString(), cmd, args, ok: false, durMs, error: cleanMsg });
-          cfg.appendLog(`${cmd} ERR ${durMs}ms ${cleanMsg}`);
-          return send(res, 200, { ok: false, error: cleanMsg, stack: stripAnsi(e.stack || '') });
+          session.logCommand({ at: new Date().toISOString(), cmd, page: targetId, args, ok: false, durMs, error: cleanMsg });
+          cfg.appendLog(`${targetId ? `[${targetId}] ` : ''}${cmd} ERR ${durMs}ms ${cleanMsg}`);
+          return send(res, 200, { ok: false, page: targetId, error: cleanMsg, stack: stripAnsi(e.stack || '') });
         }
       }
+
       return send(res, 404, { ok: false, error: `no route for ${req.method} ${req.url}` });
     } catch (e) {
       return send(res, 500, { ok: false, error: e.message, stack: e.stack });
@@ -451,13 +556,11 @@ async function runDaemon({ scriptPath }) {
     node: process.version,
   });
   await cfg.writeInstallFile(scriptPath);
-  cfg.appendLog(`daemon listening pid=${process.pid} port=${port} channel=${channel} headless=${headless}`);
+  cfg.appendLog(`daemon listening pid=${process.pid} port=${port}`);
   process.stdout.write(
     `nativewright daemon ready pid=${process.pid} port=${port} ` +
-    `userDataDir="${cfg.userDataDir()}"\n`
+    `userDataDir="${cfg.userDataDir()}" idleExitMs=${cfg.IDLE_EXIT_MS}\n`
   );
-
-  // ---- shutdown hooks ----------------------------------------------------
 
   let shuttingDown = false;
   async function shutdown(code = 0) {
@@ -469,27 +572,17 @@ async function runDaemon({ scriptPath }) {
     try { await cfg.deleteLockfile(); } catch {}
     process.exit(code);
   }
+  session.setShutdown(shutdown);
 
   process.on('SIGINT',  () => shutdown(0));
   process.on('SIGTERM', () => shutdown(0));
-  if (process.platform === 'win32') process.on('SIGBREAK', () => shutdown(0));
+  process.on('SIGBREAK', () => shutdown(0));
   process.on('uncaughtException',  (e) => { cfg.appendLog(`uncaught: ${e.stack || e.message}`); });
   process.on('unhandledRejection', (e) => { cfg.appendLog(`unhandled: ${e && (e.stack || e.message) || e}`); });
   context.on('close', () => {
     cfg.appendLog('context closed by browser — shutting down');
     shutdown(0);
   });
-}
-
-/**
- * Parse a boolean-ish env var (`"1"`, `"true"`, `"yes"` → true).
- * @param {string} name
- * @returns {boolean}
- */
-function envFlag(name) {
-  const v = process.env[name];
-  if (v == null) return false;
-  return /^(1|true|yes|on)$/i.test(v);
 }
 
 module.exports = { runDaemon };

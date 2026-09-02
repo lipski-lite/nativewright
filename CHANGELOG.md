@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] — 2026-09-02
+
+Multi-agent release. Any number of clients can now share one daemon safely,
+each with its own page in its own window. This changes the command contract
+(see **Removed** / **Changed**) — hence the major bump.
+
+### Added
+- **Stable page ids.** `new` returns `p1`, `p2`, … — an id that never changes for the page's lifetime and is never reused, even when other pages close. `new` accepts `--label=<name>` (shown by `pages` so a person can tell whose window is whose) and `--window=false` to open a tab instead of a window.
+- **Explicit, atomic page targeting.** Every page command takes `--page=<id>`; the daemon binds the command to that page inside the page's own serialized queue. Commands on different pages run concurrently. Responses echo the targeted page: `{ok, page, result}`.
+- **Ambiguity refusal.** With more than one page open and no `--page`, the daemon refuses with a clear error instead of guessing. A lone page needs no flag. `NATIVEWRIGHT_PAGE=<id>` pins a default page for a shell; the REPL pins the page it creates (`use <id>` / `use` to change or clear).
+- **A window per page.** `new` opens each page in its own browser window (`Target.createTarget newWindow`). A page in its own window stays a foreground page — `visibilityState: 'visible'`, timers and rAF running — even when other windows overlap it. Windows are cascaded so a person sees them apart. Falls back to a tab if the browser-level CDP session is unavailable.
+- **Per-page state.** Frame scope (`frame`), dialog policy (`dialog`), and console / network / download buffers are now per page instead of daemon-global.
+- **Artifacts next to the caller.** `shot`, `save-artifact`, and captured downloads are written under the requesting client's working directory (`./artifacts/`), so agents in different projects don't mix output. `upload` and `eval-file` paths resolve relative to the caller too. `NATIVEWRIGHT_ARTIFACTS_DIR` still forces one location.
+- **Lease-based lifecycle.** Clients `close --page=<id>` when done. When no pages have been open for `NATIVEWRIGHT_IDLE_EXIT_MS` (default 10 min; `0` = never) the daemon exits gracefully, flushing the profile. `stop` refuses while pages are open; `stop --force` shuts down regardless. A minimized internal keeper window keeps Chromium alive between leases.
+- `status` now reports `pageCount` and the open pages (id, label, url); `--verbose` adds the idle-timer state. Log lines are tagged with the page they acted on (`[p3] fill ok 6272ms`).
+- Env vars are accepted under both `NATIVEWRIGHT_` and the legacy `PATCHRIGHT_` prefix, so neither spelling is silently ignored.
+
+### Changed — human-behavior layer
+- **Pointer coalescing.** Mouse motion is dispatched as per-frame bursts of sub-samples via CDP with explicit monotonically increasing timestamps, so `PointerEvent.getCoalescedEvents()` returns several distinct, correctly ordered samples per `pointermove` (scaling with motion speed) instead of always exactly one. Falls back to the classic per-point path if a CDP session can't be created.
+- **Keyboard.** Keystrokes are emitted via CDP keyed on the physical `code`, with explicit `ShiftLeft` keydown/keyup around capitals and shifted symbols (Shift is held across consecutive shifted characters, as a typist does). The typo path uses the same emitter. Per-key dwell is encoded in the keyUp timestamp, so observed dwell is a continuous value rather than one snapped to the OS timer tick. Unmapped characters (emoji, accented letters, CJK) fall back to the previous press path.
+- **Field clearing.** The select-all gesture before typing varies per call (triple/double/single/no click, then `Ctrl+A`, then `Delete` or `Backspace`) instead of one fixed sequence.
+- **Think-time.** The 15% "fast hand-off" branch now returns a brief non-zero pause instead of exactly 0 ms.
+
+### Removed
+- `switch <index>` — there is no shared active page anymore. Calling it returns an error explaining `--page=<id>`.
+- Numeric page indices. `pages` reports ids.
+- `close-page` is kept as an alias of `close` but is deprecated.
+
+### Migration
+1. After `start` / `wait-ready`, call `nativewright new --label=<task>` and keep the returned `page` id.
+2. Add `--page=<id>` to every page command (or export `NATIVEWRIGHT_PAGE=<id>` in a persistent shell).
+3. Replace `switch N` + command with the command itself carrying `--page=<id>`.
+4. Replace the end-of-task `stop` with `close --page=<id>`. Use `stop` only as an administrative shutdown (`--force` if pages are open).
+
 ## [1.0.0] — 2026-04-22
 
 Initial public release.

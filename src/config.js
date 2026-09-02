@@ -11,6 +11,9 @@
  *
  * All public helpers are environment-variable-driven, so tests and
  * advanced users can redirect every path without touching the code.
+ * Every variable is read under the `NATIVEWRIGHT_` prefix first and the
+ * legacy `PATCHRIGHT_` prefix second, so an operator following either
+ * spelling is never silently ignored.
  *
  * @module config
  */
@@ -20,6 +23,15 @@ const fsp = require('fs/promises');
 const path = require('path');
 const os = require('os');
 const http = require('http');
+
+/**
+ * Read an env var by suffix under both accepted prefixes.
+ * @param {string} suffix e.g. 'USER_DATA_DIR'
+ * @returns {string} value or '' when unset
+ */
+function envAny(suffix) {
+  return process.env['NATIVEWRIGHT_' + suffix] || process.env['PATCHRIGHT_' + suffix] || '';
+}
 
 // ---------- platform-aware root directory ---------------------------------
 
@@ -33,7 +45,8 @@ const http = require('http');
  * @returns {string} absolute directory path
  */
 function nativewrightHome() {
-  if (process.env.NATIVEWRIGHT_HOME) return process.env.NATIVEWRIGHT_HOME;
+  const forced = envAny('HOME');
+  if (forced) return forced;
   const home = os.homedir();
   if (process.platform === 'win32') {
     const local = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
@@ -55,22 +68,41 @@ const LOG_FILE        = path.join(LOG_DIR, 'daemon.log');
 const DEFAULT_PROFILE = path.join(ROOT_DIR, 'profile', 'default');
 
 /**
+ * Graceful idle exit: after the LAST client page has been closed for this
+ * long, the daemon shuts down cleanly (the browser flushes cookies/tokens
+ * to the profile). `0` disables idle exit — the daemon stays resident until
+ * an explicit `stop`.
+ * @type {number} milliseconds
+ */
+const IDLE_EXIT_MS = (() => {
+  const v = envAny('IDLE_EXIT_MS');
+  if (v === '') return 10 * 60 * 1000;
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : 10 * 60 * 1000;
+})();
+
+/**
  * Persistent browser profile directory (overridable via env).
  * @returns {string}
  */
 function userDataDir() {
-  return process.env.NATIVEWRIGHT_USER_DATA_DIR || DEFAULT_PROFILE;
+  return envAny('USER_DATA_DIR') || DEFAULT_PROFILE;
 }
 
 /**
  * Directory for screenshot / HTML / metadata artifacts.
- * Defaults to `./artifacts` under the current working directory so
- * evidence lands next to the project being inspected.
+ *
+ * Artifacts land next to the CLIENT that asked for them — `./artifacts`
+ * under the caller's working directory — so agents working in different
+ * projects each get their own output folder. An explicit env override wins.
+ *
+ * @param {string} [cwd] the requesting client's working directory
  * @returns {string}
  */
-function artifactsDir() {
-  if (process.env.NATIVEWRIGHT_ARTIFACTS_DIR) return process.env.NATIVEWRIGHT_ARTIFACTS_DIR;
-  return path.join(process.cwd(), 'artifacts');
+function artifactsDir(cwd) {
+  const forced = envAny('ARTIFACTS_DIR');
+  if (forced) return forced;
+  return path.join(cwd || process.cwd(), 'artifacts');
 }
 
 /**
@@ -95,7 +127,8 @@ function ensureDir(dir) {
  * @returns {string|null}
  */
 function chromeExecutable() {
-  if (process.env.NATIVEWRIGHT_CHROME_PATH) return process.env.NATIVEWRIGHT_CHROME_PATH;
+  const forced = envAny('CHROME_PATH');
+  if (forced) return forced;
 
   const home = os.homedir();
   let candidates;
@@ -165,7 +198,7 @@ async function readLockfile() {
 }
 
 /**
- * Write the daemon lockfile atomically.
+ * Write the daemon lockfile.
  * @param {Lockfile} obj
  * @returns {Promise<void>}
  */
@@ -278,8 +311,8 @@ function appendLog(line) {
 }
 
 module.exports = {
-  ROOT_DIR, LOCK_FILE, INSTALL_FILE, LOG_DIR, LOG_FILE, DEFAULT_PROFILE,
-  nativewrightHome, userDataDir, artifactsDir, chromeExecutable, ensureDir,
+  ROOT_DIR, LOCK_FILE, INSTALL_FILE, LOG_DIR, LOG_FILE, DEFAULT_PROFILE, IDLE_EXIT_MS,
+  envAny, nativewrightHome, userDataDir, artifactsDir, chromeExecutable, ensureDir,
   readLockfile, writeLockfile, deleteLockfile, writeInstallFile,
   pidAlive, httpPing, verifyLockfile,
   makeArtifactName, appendLog,

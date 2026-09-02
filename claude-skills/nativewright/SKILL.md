@@ -1,13 +1,13 @@
 ---
 name: nativewright
-description: Use when a task needs a real browser — navigating JavaScript-heavy sites, interacting with logged-in accounts, clicking/typing/filling forms, taking screenshots, inspecting rendered DOM, driving SPAs, or anything that WebFetch/WebSearch cannot do. Routes ALL browser automation through the shared NativeWright daemon so state, cookies, and sessions persist across calls.
+description: Use when a task needs a real browser — navigating JavaScript-heavy sites, interacting with logged-in accounts, clicking/typing/filling forms, taking screenshots, inspecting rendered DOM, driving SPAs, or anything that WebFetch/WebSearch cannot do. Routes ALL browser automation through the shared NativeWright daemon so state, cookies, and sessions persist across calls. Any number of agents can use it at once — each gets its own page in its own window.
 ---
 
 # NativeWright
 
 One principle: **route every browser automation action through the shared NativeWright daemon. Never use ad-hoc browser automation.**
 
-NativeWright wraps Patchright — a stealth-patched Playwright fork — in a long-lived HTTP daemon, so AI coding agents (Claude Code, Cursor, Codex, Gemini CLI) can drive a single real Chrome with a persistent profile across many one-shot shell calls.
+NativeWright wraps Patchright — a Playwright fork — in a long-lived HTTP daemon, so AI coding agents (Claude Code, Cursor, Codex, Gemini CLI) can drive a single real Chrome with a persistent profile across many one-shot shell calls. Any number of agents can share one daemon safely: **every agent gets its own page, in its own window, addressed by a stable id.**
 
 ## When to use this skill
 
@@ -17,7 +17,7 @@ Use this skill when the task involves:
 - Visiting a site that requires login or session cookies.
 - Capturing screenshots, HTML, or DOM for evidence.
 - Stepping through a multi-step flow (checkout, wizard, generator).
-- Monitoring browser-side console or network traffic.
+- Monitoring browser-side network traffic.
 
 ## When NOT to use
 
@@ -29,27 +29,27 @@ Prefer lighter tools instead when:
 
 Rule of thumb: launching a browser is expensive. Skip it when a plain HTTP request suffices.
 
-## Locating the script
+## Locating the binary
 
-The daemon self-registers its absolute path on every `start`. Read it from the platform-default install pointer:
-
-| OS | Install pointer |
-|---|---|
-| Windows | `%LOCALAPPDATA%\NativeWright\install.json` |
-| macOS | `~/Library/Application Support/NativeWright/install.json` |
-| Linux/BSD | `${XDG_DATA_HOME:-~/.local/share}/nativewright/install.json` |
-
-The `scriptPath` field resolves to `browser.js`. If you installed globally via `npm install -g nativewright`, the bin `nativewright` is on PATH and you can call it directly.
-
-If nothing is installed yet:
+If installed globally via `npm install -g nativewright`, the bin `nativewright` is on PATH — call it directly. If nothing is installed yet:
 
 ```bash
 npm install -g nativewright
 npx patchright install chrome        # or: chromium
-nativewright start             # run once to self-register; then stop
 ```
 
-Always reference the binary by `nativewright` (if on PATH) or the resolved `scriptPath`. Never hardcode paths.
+Always reference the binary as `nativewright`. Never hardcode script paths.
+
+## The model: one page per agent, addressed by a stable id
+
+The daemon has **no shared "active page"**. Every page-targeting command names its page with `--page=<id>`, and the daemon binds the command to that page inside that page's own queue. Two agents can never clobber each other because nothing they touch is shared mutable state.
+
+- `new` opens a page **in its own window** and returns a stable id (`p1`, `p2`, …). The id never changes and is never reused, even when other pages close.
+- Pass `--page=<id>` on **every** page command. If exactly one page is open you may omit it; if more than one is open and you omit it, the daemon **refuses** with a clear error (it never guesses — a guess is how one agent would end up driving another's page).
+- Frame scope, dialog policy, console/network buffers are all per page.
+- Commands on different pages run **concurrently**; commands on the same page are serialized.
+- Artifacts (`shot`, `save-artifact`, downloads) are written under **your** working directory (`./artifacts/`), not the daemon's — agents in different projects don't mix files.
+- A page in its own window stays a foreground page (`visibilityState: 'visible'`, timers and rAF running) even when other windows overlap it. Background *tabs* in a shared window are hidden and throttled, which breaks animations, observers, lazy-loading and screenshots — that is why each page gets a window.
 
 ## Lifecycle in an agent session
 
@@ -57,144 +57,118 @@ Always reference the binary by `nativewright` (if on PATH) or the resolved `scri
 digraph lifecycle {
   "status" [shape=box];
   "running?" [shape=diamond];
-  "start (run_in_background)" [shape=box];
-  "wait-ready" [shape=box];
-  "<cmd> one-shots" [shape=box];
+  "start (run_in_background) + wait-ready" [shape=box];
+  "new --label=<task>  →  MY_PAGE" [shape=box];
+  "<cmd> --page=$MY_PAGE  (one-shots)" [shape=box];
   "more work now?" [shape=diamond];
-  "stop — MANDATORY on task complete" [shape=doublecircle];
+  "close --page=$MY_PAGE — MANDATORY on task complete" [shape=doublecircle];
 
   "status" -> "running?";
-  "running?" -> "<cmd> one-shots" [label="yes"];
-  "running?" -> "start (run_in_background)" [label="no"];
-  "start (run_in_background)" -> "wait-ready";
-  "wait-ready" -> "<cmd> one-shots";
-  "<cmd> one-shots" -> "more work now?";
-  "more work now?" -> "<cmd> one-shots" [label="yes"];
-  "more work now?" -> "stop — MANDATORY on task complete" [label="no"];
+  "running?" -> "new --label=<task>  →  MY_PAGE" [label="yes"];
+  "running?" -> "start (run_in_background) + wait-ready" [label="no"];
+  "start (run_in_background) + wait-ready" -> "new --label=<task>  →  MY_PAGE";
+  "new --label=<task>  →  MY_PAGE" -> "<cmd> --page=$MY_PAGE  (one-shots)";
+  "<cmd> --page=$MY_PAGE  (one-shots)" -> "more work now?";
+  "more work now?" -> "<cmd> --page=$MY_PAGE  (one-shots)" [label="yes"];
+  "more work now?" -> "close --page=$MY_PAGE — MANDATORY on task complete" [label="no"];
 }
 ```
 
-### Check before starting
+### 1. Check / start
 
 ```bash
 nativewright status
 ```
 
-If `running: true`, the daemon already holds Chrome with a warm profile — reuse it, don't start a new one.
-
-### Start (only if not running)
-
-From Claude Code, ALWAYS launch the daemon in the background:
+If `running: true`, reuse it (other agents may already have pages — that's fine). If not:
 
 ```
 Bash(command='nativewright start', run_in_background=true)
 ```
 
-Immediately follow with a synchronous wait so subsequent commands don't race startup:
-
 ```bash
 nativewright wait-ready --timeout=30000
 ```
 
-`wait-ready` exits 0 as soon as the HTTP server accepts the ping.
-
-### Drive the browser
-
-Every command is one-shot. Exit code 0 = `ok:true`, exit code 1 = `ok:false`. Output is always JSON.
+### 2. Claim your page
 
 ```bash
-nativewright goto https://example.com
-nativewright text h1
-nativewright click "button.submit"
-nativewright fill "input[name=q]" "my query"
-nativewright shot baseline
+nativewright new --label=<short-task-name>
+# → {"ok":true,"result":{"page":"p3","url":"about:blank","windowId":…,"hint":"pass --page=p3 …"}}
 ```
+
+Remember the returned `page` id (call it `MY_PAGE`) for the rest of your task. The label shows up in `pages` so a human can tell whose window is whose.
+
+### 3. Drive your page
+
+Every command is one-shot. Exit code 0 = `ok:true`, exit code 1 = `ok:false`. Output is always JSON and echoes the `page` it acted on.
+
+```bash
+nativewright goto https://example.com --page=$MY_PAGE
+nativewright text h1 --page=$MY_PAGE
+nativewright click "button.submit" --page=$MY_PAGE
+nativewright fill "input[name=q]" "my query" --page=$MY_PAGE
+nativewright shot baseline --page=$MY_PAGE
+```
+
+In a persistent shell you may pin the page once instead of repeating the flag: `export NATIVEWRIGHT_PAGE=p3` (an explicit `--page` always wins). From Claude Code each Bash call is a fresh shell, so just pass `--page`.
+
+### 4. Release your page — MANDATORY when the task is complete
+
+<HARD-GATE>
+When your browser task is done, you MUST close your page before your final message to the user:
+
+```bash
+nativewright close --page=$MY_PAGE
+```
+
+Do NOT call `stop` as part of normal work. Pages are leases: closing yours releases it; other agents' pages keep running. When no pages have been open for `NATIVEWRIGHT_IDLE_EXIT_MS` (default 10 min; `0` = never) the daemon exits gracefully on its own, flushing cookies and session state to the profile. Leaving your page open after the task is over holds the daemon up and leaks a window.
+</HARD-GATE>
+
+**`stop` is an admin operation.** It refuses while any page is open (`stop refused: N page(s) still open …`). Use `stop --force` only when you deliberately want to shut everything down regardless of other agents (e.g. the human asked, or you are recovering a wedged browser).
+
+**Decision rule**: if you are about to say "готово" / "done" / present the final artifact, the line above it should be `close --page=$MY_PAGE`.
 
 ### Human-behavior layer (on by default)
 
-Every interaction command (`click`, `dblclick`, `rightclick`, `fill`, `type`, `press`, `hover`, `scroll`, and the post-load idle of `goto`) routes through a realistic input synthesizer: cubic Bézier mouse paths, Fitts-like timing, log-normal keystroke cadence, real `page.mouse.wheel` ticks, etc. This is the default and what you want 99% of the time — it's the whole point of driving a real browser instead of a headless scraper.
+Every interaction command (`click`, `dblclick`, `rightclick`, `fill`, `type`, `press`, `hover`, `scroll`, and the post-load idle of `goto`) routes through a realistic input synthesizer: curved mouse paths with per-frame coalesced pointer samples, Fitts-like timing, keystrokes with real Shift handling and per-key dwell, real `page.mouse.wheel` ticks. This is the default and what you want almost always.
 
 **When to use `--raw=true`** (opt out):
-- The element is invisible / offscreen and you just need the click dispatched.
-- Scripted logins or scripted form fills where the ~600-1200 ms human typing would itself look suspicious (because *typing* a password at human speed looks like password guessing, whereas a paste happens instantly).
-- You're benchmarking raw throughput or running a deterministic test suite where timing variance is noise.
-- The target site does not have anti-bot (internal tools, test environments).
+- The element is invisible / offscreen and you just need the event dispatched.
+- Deterministic test suites where timing variance is noise.
+- Internal tools / test environments where fidelity doesn't matter.
 
-```bash
-nativewright click ".hidden-toggle" --raw=true
-nativewright fill "#api-token" "$TOKEN" --raw=true
-```
+**`--seed=<int>`** makes the randomness reproducible for debugging a flaky selector. Never reuse a fixed seed across real sessions — identical trajectories across runs are a fingerprint.
 
-**When to use `--seed=<int>`**:
-- You want reproducible randomness across runs (same seed → same path / delays / typos).
-- Useful for debugging a flaky selector: fix the randomness, isolate the bug.
-
-```bash
-nativewright click ".flaky-button" --seed=42
-```
-
-**Telemetry from `click` in human mode** — useful when debugging "my click didn't register":
-
-```json
-{
-  "landedAt": { "x": 842, "y": 517 },
-  "targetBox": { "x": 810, "y": 500, "width": 80, "height": 34 },
-  "moveMs": 247,
-  "totalMs": 389
-}
-```
-
-**Default behaviour you should be aware of**:
-- `goto` adds a 300-2000 ms "reading" pause after load before returning — real users don't fire the next action the instant `load` event fires.
-- `fill` does a triple-click + Ctrl+A + Delete to clear, THEN types the new value at human cadence. This is slower than raw `page.fill()` but works on React-controlled inputs and contenteditables that reject programmatic fill.
-- `type` clicks the field first (focus via real mouse event), waits, then types.
-- Typo simulation (~0.8% per char) is **auto-disabled for password/OTP/CVV/PIN/secret/token fields** — the skill sniffs the focused element's `type`, `name`, `id`, `autocomplete` attributes.
-- Scroll uses real wheel events and **stops automatically** when the page can't scroll further (edge-detection via `window.scrollY` stall).
-
-### Stop — MANDATORY when the task is complete
-
-<HARD-GATE>
-When the browser-related task is done, you MUST call `stop`. Leaving Chrome running after the task is over, or closing it any other way (Ctrl+C on the background job, killing the PID, clicking the X), risks:
-- cookies / localStorage / device tokens not being flushed to disk → next session shows you logged out;
-- a stale profile lock in the user-data directory → next `start` fails with "profile already in use";
-- zombie `chrome` processes holding RAM.
-
-The ONLY correct way to finish:
-
-```bash
-nativewright stop
-```
-
-This gracefully closes the `BrowserContext` (Chrome flushes everything to disk), releases the profile lock, reaps child processes, and deletes the lockfile. The next `start` then opens the same profile with ALL login state intact.
-</HARD-GATE>
-
-**When NOT to stop yet**: if you're in the middle of a multi-step flow and will issue more commands in the same or next turn, keep the daemon running — don't stop between commands. Only stop when the **overall task** is complete.
-
-**Decision rule**: before your final message to the user reporting the task is done, call `stop`. This should become reflex — if you're about to say "готово" / "done" / present the final artifact, the line above it should be the stop command.
+**Behaviour to be aware of**:
+- `goto` adds a 300–2000 ms "reading" pause after load.
+- `fill` selects and clears the field (gesture varies), then types at human cadence — works on React-controlled inputs and contenteditables that reject programmatic fill.
+- `type` clicks the field first (focus via real mouse event), then types.
+- Typo simulation (~0.8% per char) is **auto-disabled for password/OTP/CVV/PIN/secret/token fields**.
+- Scroll uses real wheel events and stops when the page can't scroll further.
 
 ## Command reference
 
-All commands accept `--timeout=<ms>` (default 30000) and `--key=value` flags for any non-positional option. **All interaction commands additionally accept `--raw=true`** (opt out of the human-behavior layer) and `--seed=<int>` (reproducible randomness).
+All page commands accept `--page=<id>` (required when >1 page is open), `--timeout=<ms>` (default 30000) and `--key=value` flags for any non-positional option. Interaction commands additionally accept `--raw=true` and `--seed=<int>`.
 
 | Group | Command | Positional | Notes |
 |---|---|---|---|
-| Pages | `new` | — | opens a fresh page, makes it active, returns its index |
-|  | `pages` | — | lists open pages with URLs |
-|  | `switch <index>` | index | activates another page |
-|  | `close-page` | — | closes the active page |
-| Nav | `goto <url>` | url | `--waitUntil=load\|domcontentloaded\|networkidle`; human-mode adds post-load idle |
+| Pages | `new [--label=name] [--window=false]` | — | opens a page in a NEW window; returns its stable id |
+|  | `pages` | — | lists open pages: id, label, url, windowId, opener, cwd |
+|  | `close --page=<id>` | — | closes that page (lease released) |
+| Nav | `goto <url>` | url | `--waitUntil=load\|domcontentloaded\|networkidle`; human post-load idle |
 |  | `back` / `forward` / `reload` | — |  |
-| Interact | `click <selector>` | selector | human Bézier path; `--raw=true`, `--button=left\|right\|middle`, `--clickCount=1\|2\|3` |
-|  | `dblclick <selector>` | selector | double-click (clickCount=2) |
+| Interact | `click <selector>` | selector | `--raw=true`, `--button=left\|right\|middle`, `--clickCount=1\|2\|3` |
+|  | `dblclick <selector>` | selector | double-click |
 |  | `rightclick <selector>` | selector | right-button click |
-|  | `fill <selector> <value>` | selector, value | human: triple-click clear + Ctrl+A fallback + typed cadence |
+|  | `fill <selector> <value>` | selector, value | select-all + clear + typed at human cadence |
 |  | `type <selector> <text>` | selector, text | human keystroke cadence; `--typos=on\|off\|auto` |
 |  | `press <key>` | key | e.g. `Enter`, `Control+A`, `ArrowDown` |
 |  | `hover <selector>` | selector | human mouse path to element |
 |  | `select <selector> <value>` | selector, value | `<select>` option |
-|  | `scroll <top\|bottom\|up\|down\|<px>>` | direction | human: real wheel ticks w/ edge-detection |
-|  | `upload <selector> <path>` | selector, path | file input; absolute or cwd-relative |
-| Wait | `wait <ms>` | ms | blind sleep (avoid when you can wait-for) |
+|  | `scroll <top\|bottom\|up\|down\|<px>>` | direction | real wheel ticks with edge-detection |
+|  | `upload <selector> <path>` | selector, path | file input; absolute or relative to YOUR cwd |
+| Wait | `wait <ms>` | ms | blind sleep (prefer wait-for) |
 |  | `wait-for <selector>` | selector | `--state=visible\|hidden\|attached\|detached` |
 |  | `wait-for-load` | — | `--state=load\|domcontentloaded\|networkidle` |
 | Read | `text [selector]` | selector? | inner text of element or body |
@@ -203,17 +177,18 @@ All commands accept `--timeout=<ms>` (default 30000) and `--key=value` flags for
 |  | `get <selector> <attr>` | selector, attr | getAttribute |
 |  | `count <selector>` | selector | number of matches |
 |  | `eval <js>` | js | expression or statements; returns `{value}` |
-|  | `cookies [--url=...]` | — | domain-scoped cookie dump |
-| Frames | `frame <name>` | name | subsequent interaction commands target this frame |
-|  | `frame --reset` | — | clear frame scope |
-| Dialogs | `dialog <accept\|dismiss> [prompt]` | action, promptText? | policy for future alert/confirm/prompt |
-| Artifacts | `shot [name]` | name? | PNG under artifactsDir |
+|  | `cookies [--url=...]` | — | domain-scoped cookie dump (pageless) |
+| Frames | `frame <name>` | name | subsequent commands on THIS page target this frame |
+|  | `frame --reset` | — | clear frame scope for this page |
+| Dialogs | `dialog <accept\|dismiss> [prompt]` | action, promptText? | policy for this page's alert/confirm/prompt |
+| Artifacts | `shot [name]` | name? | PNG under `./artifacts/` of your cwd |
 |  | `save-artifact [name]` | name? | PNG + HTML + metadata JSON bundle |
-|  | `downloads [--n=N]` | — | list captured downloads with auto-saved paths |
-| Diagnostics | `console [--n=N]` | — | recent console.* messages |
-|  | `network-log [--n=N]` | — | recent requests/responses |
-|  | `state` | — | pages, active idx, command ring buffer |
-| Viewport | `viewport <w> <h> --force` | w, h | stealth-risky; requires `--force` |
+|  | `downloads [--n=N]` | — | this page's captured downloads |
+| Diagnostics | `network-log [--n=N]` | — | this page's recent requests/responses |
+|  | `state` | — | daemon snapshot: pages, idle timer, recent commands (pageless) |
+| Viewport | `viewport <w> <h> --force` | w, h | overrides the real window geometry; requires `--force` |
+
+`switch` and page indices no longer exist — ids are stable and every command names its page.
 
 ## Persistent profile
 
@@ -225,9 +200,11 @@ The profile lives under the platform-default data root (override via `NATIVEWRIG
 | macOS | `~/Library/Application Support/NativeWright/profile/default/` |
 | Linux/BSD | `${XDG_DATA_HOME:-~/.local/share}/nativewright/profile/default/` |
 
-Cookies, localStorage, and IndexedDB survive `stop`/`start`. Sessions on mature sites (Google, Microsoft) typically last ~2 weeks before device-token re-auth.
+Cookies, localStorage, and IndexedDB survive daemon restarts. Sessions on mature sites (Google, Microsoft) typically last ~2 weeks before device-token re-auth.
 
-**Never open a normal Chrome window pointed at the same profile directory.** Chrome holds a profile lock; a second opener will fail or corrupt state. If the daemon `start` fails with a profile-lock error, a real Chrome (or a zombie NativeWright Chrome) is using the directory — stop the daemon, close Chrome, check `tasklist | findstr chrome` (Windows) or `pgrep -fl chrome` (Unix), then retry.
+**Never open a normal Chrome window pointed at the same profile directory.** Chrome holds a profile lock; a second opener will fail or corrupt state. If `start` fails with a profile-lock error, a real Chrome (or a zombie daemon Chrome) is using the directory — close it, check `tasklist | findstr chrome` (Windows) or `pgrep -fl chrome` (Unix), then retry.
+
+**One daemon per profile.** All agents working under the same logged-in identity share one daemon (each with their own page). Distinct identities/accounts need distinct profiles → distinct daemons via separate `NATIVEWRIGHT_HOME` roots.
 
 ## First-run login
 
@@ -235,24 +212,25 @@ If the target site requires login and your profile has none yet, delegate to the
 
 ## Debugging
 
-- `nativewright status --verbose` dumps the last 20 commands with timings.
-- `nativewright console` pulls captured `console.log/warn/error` from the active page (page events are suppressed by Patchright stealth; the script re-injects a hook on every navigation).
-- `nativewright network-log` shows recent requests.
-- The daemon log is at `$NATIVEWRIGHT_HOME/logs/daemon.log`.
-- If a one-shot returns `ok:false`, the same daemon stays alive — you can immediately diagnose without restarting.
-- Stale lockfile (`daemon.json` exists but `status` says `running:false`)? `nativewright start` will detect and reap it automatically.
+- `nativewright status` lists open pages (id, label, url); `--verbose` adds the last 20 commands with timings and the idle-timer state.
+- `nativewright network-log --page=$MY_PAGE` shows this page's recent requests.
+- The daemon log is at `$NATIVEWRIGHT_HOME/logs/daemon.log`; every line is tagged with the page it acted on (`[p3] fill ok 6272ms`).
+- If a one-shot returns `ok:false`, the daemon and your page stay alive — diagnose immediately without restarting.
+- Stale lockfile (`daemon.json` exists but `status` says `running:false`)? `nativewright start` reaps it automatically.
 
 ## Common pitfalls
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `daemon not running` | lockfile missing or stale | run `start` in background, then `wait-ready` |
-| `ECONNREFUSED` on CLI | daemon crashed mid-command | `nativewright start` auto-reaps stale lockfile |
-| `console` returns empty | no hook for the current page yet | after first `goto`/`reload`/`new` it will populate |
+| `N pages are open (...); pass --page=<id>` | you omitted `--page` while other agents have pages | pass `--page=$MY_PAGE` (always do, it's harmless when alone) |
+| `no page 'p3'` | that page was closed, or a typo | `nativewright pages`; if yours is gone, `new` again |
+| `no pages open — run new first` | nobody has claimed a page yet | `nativewright new --label=…` |
+| `daemon not running` | never started, or idle-exited after the last page closed | `start` in background, then `wait-ready`, then `new` |
+| `stop refused: N page(s) still open` | other agents are mid-task | just `close --page=$MY_PAGE`; only `stop --force` if you truly mean to kill everything |
 | Selector timeout | element hasn't rendered | prefer `wait-for <selector>` over blind `wait <ms>` |
 | `profile lock` error on start | a Chrome already uses the profile | close that Chrome; check processes |
-| `viewport` rejected | stealth guardrail | pass `--force=true` AND understand you're breaking stealth |
+| `viewport` rejected | guardrail | pass `--force=true` and understand you're overriding real geometry |
 
 ## Routing other skills through this one
 
-When other skills need a browser, they **must** defer here. Never invent parallel browser logic. Never reach for Playwright directly. Never launch Chrome manually. Always go through `nativewright`.
+When other skills need a browser, they **must** defer here: claim a page with `new`, pass `--page=$MY_PAGE` on every command, `close` it when done. Never invent parallel browser logic. Never reach for Playwright directly. Never launch Chrome manually.

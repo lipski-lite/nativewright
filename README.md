@@ -79,7 +79,8 @@ Profile persistence means the browser session survives `stop`/`start` cycles: ag
 
 ## Features
 
-- **Human-behavior layer (enabled by default)** — mouse moves along cubic Bézier paths with Gaussian jitter, mid-path hesitation, and overshoot-and-correct; keystrokes use log-normal cadence with per-key dwell and optional typo-simulation; scrolls via real `page.mouse.wheel` ticks with edge-detection. Opt out per-call with `--raw=true`. See [Human-behavior layer](#human-behavior-layer) below.
+- **Multi-agent by design** — any number of agents share one daemon; each `new` page opens in its own window with a stable id, every command names its page (`--page=<id>`), pages have their own queues and state, and artifacts land in the caller's project. No shared "active page" to clobber. See [Multiple agents at once](#multiple-agents-at-once).
+- **Human-behavior layer (enabled by default)** — mouse moves along cubic Bézier paths with Gaussian jitter, mid-path hesitation, and overshoot-and-correct, dispatched as per-frame coalesced pointer samples; keystrokes use log-normal cadence with per-key dwell, explicit Shift handling and optional typo-simulation; scrolls via real `page.mouse.wheel` ticks with edge-detection. Opt out per-call with `--raw=true`. See [Human-behavior layer](#human-behavior-layer) below.
 - **Persistent profile** — cookies, localStorage, IndexedDB, and device tokens survive `stop`/`start`. Log into Google once; Gemini / Gmail / Docs stay live for ~2 weeks per Google's token lifetime.
 - **Real Chrome by default** — `channel: 'chrome'` for maximum stealth; drops to bundled Chromium for CI (`NATIVEWRIGHT_CHANNEL=chromium`).
 - **Stealth preserved** — built on Patchright; no custom UA, no headless by default, no leftover automation flags. Eliminates the detection signals vanilla Playwright emits out of the box, so your own automation of your own accounts looks like normal usage.
@@ -183,13 +184,16 @@ npx patchright install chrome          # or: npx patchright install chromium
 nativewright start &
 nativewright wait-ready --timeout=30000
 
-# 4. Drive the browser — one-shot commands, JSON output
-nativewright goto https://example.com
-nativewright text h1
-nativewright shot hello
+# 4. Claim your own page — it opens in its own window and returns a stable id
+nativewright new --label=hello           # → {"page":"p1", ...}
 
-# 5. Finish cleanly when the task is done
-nativewright stop
+# 5. Drive it — one-shot commands, JSON output, each naming the page
+nativewright goto https://example.com --page=p1
+nativewright text h1 --page=p1
+nativewright shot hello --page=p1
+
+# 6. Release the page when the task is done (the daemon idle-exits on its own)
+nativewright close --page=p1
 ```
 
 Without a global install, just prefix with `npx`:
@@ -197,16 +201,19 @@ Without a global install, just prefix with `npx`:
 ```bash
 npx nativewright start &
 npx nativewright wait-ready
-npx nativewright goto https://example.com
+npx nativewright new --label=hello       # → p1
+npx nativewright goto https://example.com --page=p1
 ```
 
 For humans who want to poke around interactively:
 
 ```bash
 nativewright repl
-# nativewright> goto https://example.com
-# nativewright> text h1
-# nativewright> shot
+# nativewright> new --label=poke          (the REPL pins the new page for you)
+# nativewright[p2]> goto https://example.com
+# nativewright[p2]> text h1
+# nativewright[p2]> shot
+# nativewright[p2]> close
 # nativewright> quit
 ```
 
@@ -214,11 +221,18 @@ nativewright repl
 
 NativeWright is designed to be driven by agents. The pattern is identical across Claude Code, Cursor, Codex, and Gemini CLI:
 
-1. **Locate the script** — `~/.local/share/nativewright/install.json` (Linux), `~/Library/Application Support/NativeWright/install.json` (macOS), `%LOCALAPPDATA%\NativeWright\install.json` (Windows). The `scriptPath` field resolves to `browser.js`; or just call the `nativewright` bin directly if it's on PATH.
-2. **Check status** — `nativewright status` → `{running: true/false, pid, port}`.
+1. **Locate the binary** — call the `nativewright` bin directly if it's on PATH; otherwise `install.json` under the data root (`~/.local/share/nativewright/` on Linux, `~/Library/Application Support/NativeWright/` on macOS, `%LOCALAPPDATA%\NativeWright\` on Windows) has a `scriptPath` that resolves to `browser.js`.
+2. **Check status** — `nativewright status` → `{running, pid, port, pageCount, pages}`.
 3. **Start if needed** — run `nativewright start` in a background-capable shell (`&`, `nohup`, or the agent's `run_in_background` facility), then `wait-ready`.
-4. **Drive the browser** — each command is a separate shell call; the daemon preserves state between them.
-5. **Stop on task completion** — `nativewright stop`. This flushes cookies to disk so the **next** task opens an already-logged-in browser.
+4. **Claim a page** — `nativewright new --label=<task>` opens a page in its own window and returns a stable id (`p1`, `p2`, …). Remember it.
+5. **Drive the page** — each command is a separate shell call carrying `--page=<id>`; the daemon preserves state between them.
+6. **Release the page on task completion** — `nativewright close --page=<id>`. Don't `stop` — other agents may be working; the daemon exits gracefully by itself once no pages have been open for the idle period (flushing cookies so the **next** task opens already logged in).
+
+### Multiple agents at once
+
+Any number of agents can share one daemon. There is **no shared "active page"**: every command names its page, and the daemon binds it to that page inside the page's own queue, so concurrent agents can never clobber each other. Page ids are stable and never re-indexed when another page closes; frame scope, dialog policy and console/network buffers are per page; commands on different pages run concurrently. If more than one page is open and you omit `--page`, the daemon **refuses** with a clear error rather than guessing. Each page lives in its own window, so it stays a foreground, `visibilityState: 'visible'` page even when other windows overlap it (background *tabs* would be hidden and throttled). Artifacts are written under the **caller's** working directory, so agents in different projects don't mix files. In a persistent shell you can pin your page once with `NATIVEWRIGHT_PAGE=p3` instead of repeating the flag.
+
+One daemon serves one profile (identity). Distinct identities need distinct profiles → separate `NATIVEWRIGHT_HOME` roots.
 
 ### Claude Code
 
@@ -235,22 +249,21 @@ Install via `npm install -g nativewright` or use `npx`. The three command modes 
 
 ## Command reference
 
-All commands accept `--timeout=<ms>` (default 30000) and `--key=value` flags for any non-positional option. All responses are JSON: `{ok: true, result: …}` or `{ok: false, error, stack?}`.
+All page commands accept `--page=<id>` (required whenever more than one page is open; a lone page needs no flag), `--timeout=<ms>` (default 30000) and `--key=value` flags for any non-positional option. All responses are JSON and echo the page they acted on: `{ok: true, page: "p1", result: …}` or `{ok: false, page, error, stack?}`.
 
 **All interaction commands also accept `--raw=true`** to opt out of the human-behavior layer (faster, straight-line mouse paths, no keystroke cadence), and `--seed=<int>` for reproducible randomness.
 
 | Group | Command | Positional | Notes |
 |---|---|---|---|
-| Pages | `new` | — | opens a fresh page, makes it active, returns its index |
-|  | `pages` | — | lists open pages with URLs |
-|  | `switch <index>` | index | activates another page |
-|  | `close-page` | — | closes the active page |
+| Pages | `new [--label=name] [--window=false]` | — | opens a page in a **new window**; returns its stable id (`p1`, `p2`, …) |
+|  | `pages` | — | lists open pages: id, label, url, windowId, opener, cwd |
+|  | `close --page=<id>` | — | closes that page (lease released) |
 | Nav | `goto <url>` | url | `--waitUntil=load\|domcontentloaded\|networkidle`; human-mode adds a post-load idle |
 |  | `back` / `forward` / `reload` | — |  |
 | Interact | `click <selector>` | selector | human Bézier path by default; `--raw=true` for straight-line |
 |  | `dblclick <selector>` | selector | double-click (clickCount=2) |
 |  | `rightclick <selector>` | selector | right-button click (context menu) |
-|  | `fill <selector> <value>` | selector, value | human: triple-click clear + Ctrl+A fallback + typed cadence |
+|  | `fill <selector> <value>` | selector, value | human: select-all + clear (gesture varies) + typed cadence with explicit Shift handling |
 |  | `type <selector> <text>` | selector, text | human keystroke cadence; `--typos=on\|off\|auto` (auto disables for password fields) |
 |  | `press <key>` | key | e.g. `Enter`, `Control+A`, `ArrowDown`; human-mode adds pre-press hesitation |
 |  | `hover <selector>` | selector | human mouse path to element |
@@ -266,16 +279,17 @@ All commands accept `--timeout=<ms>` (default 30000) and `--key=value` flags for
 |  | `get <selector> <attr>` | selector, attr | `getAttribute` |
 |  | `count <selector>` | selector | number of matches |
 |  | `eval <js>` | js | expression or statements; returns `{value}` |
-|  | `cookies [--url=...]` | — | domain-scoped cookie dump |
-| Frames | `frame <name>` / `frame --reset` | name | scope interactions to a frame |
-| Dialogs | `dialog <accept\|dismiss> [prompt]` | action, promptText? | policy for future alert/confirm/prompt |
-| Artifacts | `shot [name]` | name? | PNG under artifactsDir |
+|  | `eval-file <path>` | path | evaluate a whole JS file in the page in one `evaluate` (path relative to the caller's cwd) |
+|  | `cookies [--url=...]` | — | domain-scoped cookie dump (pageless) |
+| Frames | `frame <name>` / `frame --reset` | name | scope this page's interactions to a frame |
+| Dialogs | `dialog <accept\|dismiss> [prompt]` | action, promptText? | this page's policy for alert/confirm/prompt |
+| Artifacts | `shot [name]` | name? | PNG under the caller's `./artifacts/` |
 |  | `save-artifact [name]` | name? | PNG + HTML + metadata JSON bundle |
-|  | `downloads [--n=N]` | — | list captured downloads with auto-saved paths |
-| Diagnostics | `console [--n=N]` | — | recent `console.*` messages (re-injected hook) |
-|  | `network-log [--n=N]` | — | recent requests/responses |
-|  | `state` | — | pages, active idx, command ring buffer |
-| Viewport | `viewport <w> <h> --force` | w, h | stealth-risky; requires `--force` |
+|  | `downloads [--n=N]` | — | this page's captured downloads with auto-saved paths |
+| Diagnostics | `console [--n=N]` | — | this page's recent `console.*` messages (re-injected hook) |
+|  | `network-log [--n=N]` | — | this page's recent requests/responses |
+|  | `state` | — | pages, idle timer, command ring buffer (pageless) |
+| Viewport | `viewport <w> <h> --force` | w, h | overrides the real window geometry; requires `--force` |
 
 ## Environment variables
 
@@ -283,7 +297,9 @@ All commands accept `--timeout=<ms>` (default 30000) and `--key=value` flags for
 |---|---|---|
 | `NATIVEWRIGHT_HOME` | per-user data root | platform default (see below) |
 | `NATIVEWRIGHT_USER_DATA_DIR` | persistent browser profile path | `<HOME>/profile/default` |
-| `NATIVEWRIGHT_ARTIFACTS_DIR` | screenshot & bundle output | `./artifacts` |
+| `NATIVEWRIGHT_ARTIFACTS_DIR` | force one screenshot & bundle output directory | the **caller's** `./artifacts` |
+| `NATIVEWRIGHT_PAGE` | default `--page` for a shell (explicit flag wins) | unset |
+| `NATIVEWRIGHT_IDLE_EXIT_MS` | graceful exit after the last page has been closed this long; `0` = never | `600000` (10 min) |
 | `NATIVEWRIGHT_CHROME_PATH` | explicit browser binary path | auto-detected |
 | `NATIVEWRIGHT_CHANNEL` | Patchright channel | `chrome` |
 | `NATIVEWRIGHT_HEADLESS` | headless mode (**CI only — breaks stealth**) | `false` |

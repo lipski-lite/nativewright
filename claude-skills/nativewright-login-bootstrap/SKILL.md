@@ -20,11 +20,11 @@ A one-off ritual that establishes a persistent logged-in session in the NativeWr
 
 ## The procedure
 
-This requires the human partner at the keyboard. You cannot log in on their behalf. The goal: open the login page in the visible Chrome window, let the human log in, confirm it worked, stop the daemon cleanly. The profile now holds the cookies.
+This requires the human partner at the keyboard. You cannot log in on their behalf. The goal: open the login page in a visible window, let the human log in, confirm it worked, release the page. The profile then holds the cookies.
 
-### 1. Confirm no Chrome is already using the profile
+Because every page opens in **its own window**, this coexists with other agents' work: your login window is separate from theirs. Tell the human which window to use (the label helps).
 
-The profile is locked exclusively. Check:
+### 1. Confirm no stray Chrome is using the profile
 
 ```bash
 nativewright status
@@ -32,9 +32,9 @@ nativewright status
 # Unix:    pgrep -fl chrome
 ```
 
-If `status` shows `running: true`, reuse it — skip to step 3. If a regular Chrome window is open against the same profile directory, close it first.
+If `status` shows `running: true`, reuse it. If a regular Chrome window is open against the same profile directory, close it first.
 
-### 2. Start the daemon in a background task
+### 2. Start the daemon if needed, then claim your page
 
 ```
 Bash(command='nativewright start', run_in_background=true)
@@ -42,68 +42,75 @@ Bash(command='nativewright start', run_in_background=true)
 
 ```bash
 nativewright wait-ready --timeout=30000
+nativewright new --label=login-bootstrap
+# → remember the returned page id as MY_PAGE
 ```
 
-### 3. Open the login URL in a visible window
+### 3. Open the login URL in your window
 
 ```bash
-nativewright goto "https://accounts.google.com/"
+nativewright goto "https://accounts.google.com/" --page=$MY_PAGE
 # or https://github.com/login, https://login.microsoftonline.com/, etc.
 ```
 
-The Chrome window is real and visible on the human partner's desktop.
+The window is real and visible on the human partner's desktop.
 
 ### 4. Hand off to the human
 
 Explicitly tell your human partner:
 
-> "A Chrome window is open at the login page. Please log in manually in that window. When you're done, reply 'done' (or the equivalent) so I can verify the session persisted."
+> "A Chrome window labelled `login-bootstrap` is open at the login page. Please log in manually in that window. When you're done, reply 'done' (or the equivalent) so I can verify the session persisted."
 
 Do not proceed until they confirm.
 
 ### 5. Verify the login took
 
 ```bash
-nativewright url                     # should no longer be the login page
-nativewright title                   # should be the post-login landing
-nativewright save-artifact login-ok  # capture evidence
+nativewright url --page=$MY_PAGE                     # should no longer be the login page
+nativewright title --page=$MY_PAGE                   # should be the post-login landing
+nativewright save-artifact login-ok --page=$MY_PAGE  # capture evidence
 ```
 
 For Google specifically, a good cross-check is to navigate to a service that requires auth:
 
 ```bash
-nativewright goto "https://myaccount.google.com/"
-nativewright text "h1"
+nativewright goto "https://myaccount.google.com/" --page=$MY_PAGE
+nativewright text "h1" --page=$MY_PAGE
 ```
 
 If it shows a personalized account page, login succeeded. Cite the artifact path.
 
-### 6. Stop the daemon — MANDATORY
+### 6. Release the page — MANDATORY
 
 <HARD-GATE>
-After the login is verified, you MUST call `stop` before ending the task. Not optional. The whole point of this skill is to persist the session — and the session is only guaranteed persisted once `stop` has flushed cookies/tokens to disk and released the profile lock.
-</HARD-GATE>
+After the login is verified, you MUST close your page before ending the task:
+
+```bash
+nativewright close --page=$MY_PAGE
+```
+
+Then, if no other agent is using the daemon, shut it down so Chrome flushes the fresh cookies/tokens to disk immediately:
 
 ```bash
 nativewright stop
 ```
 
-Why this matters specifically for login-bootstrap: the cookies Google / Microsoft / SaaS just issued are held in Chrome's in-memory state. Chrome flushes them to disk periodically, but graceful `stop` is the only way to guarantee they land before process exit. If the daemon is killed without `stop` (timeout, Ctrl+C, taskkill), the new login may not survive to the next session — and you'll have to repeat this entire bootstrap.
-
-The next `nativewright start` will open the same profile with all cookies intact — only if you stopped cleanly.
+If `stop` is refused because other agents still have pages open, do **not** force it. The session is still safe: Chrome persists cookies continuously while running, and the daemon exits gracefully (a full flush) once the last page has been closed for the idle period. Never kill the daemon any other way (Ctrl+C, taskkill) — an unclean exit is the one path that can lose the new login.
+</HARD-GATE>
 
 ## Critical rules
 
-- **Never open the profile in a normal Chrome window.** Chrome holds an exclusive lock on a profile directory; opening it a second time (even from a stock Chrome launcher) will corrupt the profile or fail loudly. The NativeWright daemon IS the owner while running; regular Chrome must use a different profile.
-- **Never do the login automatically.** Scripting credential entry trips anti-automation heuristics on Google and Microsoft hard. The whole point of Patchright's stealth is that the human does the login; the daemon just holds the resulting session.
+- **Never open the profile in a normal Chrome window.** Chrome holds an exclusive lock on a profile directory; opening it a second time will corrupt the profile or fail loudly. The NativeWright daemon IS the owner while running.
+- **Never do the login automatically.** The human does the login; the daemon just holds the resulting session.
 - **Never share the profile directory.** It contains personal session tokens. Keep it local.
-- **Session lifetime varies**: Google ~14 days, Microsoft ~14-90 days, GitHub months, most SaaS days-to-months. When automation starts bouncing to a login page, rerun this skill.
+- **Session lifetime varies**: Google ~14 days, Microsoft ~14–90 days, GitHub months, most SaaS days-to-months. When automation starts bouncing to a login page, rerun this skill.
 
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
 | `start` fails with profile-lock error | something else holds the profile | close all Chrome windows, terminate any zombie processes, retry |
-| Login page shows "This browser may not be secure" | Google's anti-automation caught something | Patchright's stealth usually bypasses this; if not, the user may need to complete an extra step in the visible window |
+| Login page shows "This browser may not be secure" | the site flagged the session | the human may need to complete an extra step in the visible window |
 | After login, next day it's logged out again | device binding not persisted | sometimes Google reissues a device token on second visit; repeat the bootstrap once more |
-| Chrome window never appears | daemon crashed on launch; OR headless mode is on | check `$NATIVEWRIGHT_HOME/logs/daemon.log`; ensure `NATIVEWRIGHT_HEADLESS` is NOT set |
+| Chrome window never appears | daemon crashed on launch | check `$NATIVEWRIGHT_HOME/logs/daemon.log`; ensure no headless env override is set |
+| Human can't find the window | several agent windows open | it's the one labelled `login-bootstrap` (`nativewright pages` shows labels) |

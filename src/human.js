@@ -206,6 +206,82 @@ function setPos(page, p) {
   MOUSE_POS.set(page, { x: p.x, y: p.y });
 }
 
+// --- CDP-backed coalesced pointer dispatch ---------------------------------
+// Real mice poll at 125-1000Hz while displays refresh at 60-144Hz, so Chromium
+// coalesces several raw samples into each dispatched `pointermove`;
+// `PointerEvent.getCoalescedEvents()` then returns those sub-samples. A path
+// driven by one *awaited* `page.mouse.move` per point produces exactly ONE
+// coalesced sub-event every time — a well-known synthetic-input signature —
+// because each awaited dispatch fully round-trips before the next is sent.
+// (Empirically verified: awaited Playwright OR awaited raw CDP both yield
+// length 1; only un-awaited bursts coalesce.)
+//
+// We reproduce real coalescing by dispatching each display-frame of motion as
+// a BURST of sub-samples fired WITHOUT awaiting between them (so they reach the
+// renderer inside one frame and coalesce), each carrying an explicit,
+// monotonically-increasing CDP `timestamp` (so the coalesced sub-events have
+// realistic distinct `timeStamp`s instead of OS-timer-quantized ones — the
+// timestamps we pass are not subject to Windows' 15.6ms setTimeout lattice).
+// This needs a CDP session; if one can't be created we fall back to the
+// classic per-point awaited dispatch (functionally correct, coalesced len 1).
+const CDP_SESSIONS = new WeakMap();
+async function getCdpSession(page) {
+  const cached = CDP_SESSIONS.get(page);
+  if (cached !== undefined) return cached;       // cache null too — don't retry
+  let s = null;
+  try { s = await page.context().newCDPSession(page); } catch { s = null; }
+  CDP_SESSIONS.set(page, s);
+  return s;
+}
+
+// Dispatch one display-frame of motion: K sub-samples interpolated from `prev`
+// to `p`, fired un-awaited so Chromium coalesces them into a single
+// `pointermove`. K scales with segment length (faster motion → more coalesced
+// samples, like real hardware). Sub-sample timestamps are anchored to
+// wall-clock at dispatch and spaced by the simulated polling interval, ending
+// at ≈ now so the page never sees events dated in the future.
+async function dispatchFrameBurst(cdp, prev, p, frameDurMs, rng, buttons) {
+  const segLen = dist(prev, p);
+  let k = Math.max(1, Math.min(7, Math.round(segLen / 5)));
+  if (k > 2 && rng() < 0.3) k -= 1;              // jitter count; keep slow segs low
+  const pollSec = (frameDurMs / k) / 1000;
+  const now = Date.now() / 1000;
+  const subs = [];
+  for (let j = 0; j < k; j++) {
+    const f = (j + 1) / k;
+    subs.push({
+      x: Math.round(prev.x + (p.x - prev.x) * f),
+      y: Math.round(prev.y + (p.y - prev.y) * f),
+      ts: now - (k - 1 - j) * pollSec,           // monotonic; last ≈ now
+    });
+  }
+  await Promise.all(subs.map((s) => cdp.send('Input.dispatchMouseEvent', {
+    type: 'mouseMoved', x: s.x, y: s.y, button: 'none', buttons: buttons || 0,
+    timestamp: s.ts,
+  })));
+}
+
+// Walk a sampled path: one dispatched `pointermove` per point, sleeping
+// `perStepMs` (jittered) between points. Uses coalesced CDP bursts when a
+// session is available, else classic awaited single moves. Returns final pos.
+async function traversePath(page, cdp, fromPoint, path, perStepMs, rng, buttons) {
+  let prev = { x: fromPoint.x, y: fromPoint.y };
+  for (let i = 0; i < path.length; i++) {
+    const p = path[i];
+    const frameDur = perStepMs * (1 + (rng() - 0.5) * 0.5);
+    if (cdp) {
+      try { await dispatchFrameBurst(cdp, prev, p, frameDur, rng, buttons); }
+      catch { await page.mouse.move(p.x, p.y, { steps: 1 }); }
+    } else {
+      await page.mouse.move(p.x, p.y, { steps: 1 });
+    }
+    // hesitation samples carry their own extra pause; others use perStep
+    await sleep((p.pauseMs || 0) + frameDur);
+    prev = { x: p.x, y: p.y };
+  }
+  return prev;
+}
+
 // Move the mouse along a natural path to (x,y). `targetW` is the effective
 // size of the target (used for Fitts timing); pass the bbox width when
 // moving toward an element.
@@ -229,6 +305,7 @@ async function moveTo(page, x, y, opts = {}) {
     return;
   }
 
+  const cdp = await getCdpSession(page);
   const durationMs = moveDurationMs(d, opts.targetW || 20, rng);
 
   // Optional overshoot: for longer moves, ~20% chance to overshoot the
@@ -247,26 +324,21 @@ async function moveTo(page, x, y, opts = {}) {
   }
 
   const { path, steps } = samplePath(from, primaryTarget, rng);
-  const perStep = durationMs / steps;
-
-  for (let i = 0; i < path.length; i++) {
-    const p = path[i];
-    await page.mouse.move(p.x, p.y, { steps: 1 });
-    const jitter = 1 + (rng() - 0.5) * 0.5;
-    // hesitation samples carry their own extra pause; others use perStep
-    await sleep((p.pauseMs || 0) + perStep * jitter);
-  }
+  await traversePath(page, cdp, from, path, durationMs / steps, rng, 0);
 
   if (overshootPoint) {
     setPos(page, overshootPoint);
     const { path: corr } = samplePath(overshootPoint, to, rng, { easing: easeOut });
     const corrDur = logNormal(rng, 90, 0.25, 60, 220);
-    const corrStep = corrDur / corr.length;
-    for (const p of corr) {
-      await page.mouse.move(p.x, p.y, { steps: 1 });
-      await sleep((p.pauseMs || 0) + corrStep);
-    }
+    await traversePath(page, cdp, overshootPoint, corr, corrDur / corr.length, rng, 0);
   }
+
+  // Sync Playwright's own mouse position to the final target: the CDP burst
+  // path bypasses Playwright's internal mouse state, so a subsequent
+  // page.mouse.down()/up() (the click) must be re-anchored here or it would
+  // fire at a stale coordinate. The cursor is already at `to` (CDP moved it),
+  // so this trailing move dispatches a harmless final settle sample.
+  try { await page.mouse.move(to.x, to.y, { steps: 1 }); } catch { /* ignore */ }
   setPos(page, to);
 }
 
@@ -429,8 +501,111 @@ function pickTypo(ch, rng) {
   return ch === ch.toUpperCase() && ch !== lower ? wrong.toUpperCase() : wrong;
 }
 
+// --- physical-key descriptors for CDP Input.dispatchKeyEvent ---------------
+// We emit keystrokes via raw CDP keyed on the PHYSICAL code so we can wrap
+// shifted characters in explicit ShiftLeft keydown/keyup events. The old path
+// (`page.keyboard.press('A')`) produced a capital with NO Shift key event in
+// the stream at all — a physically-impossible signature any keystroke-dynamics
+// model flags instantly. Keying on `code` (not the char) also avoids
+// Playwright re-resolving Shift and re-introducing the bug.
+function buildKeyMap() {
+  const m = {};
+  const add = (ch, code, vk, shift) => { m[ch] = { code, vk, key: ch, text: ch, shift: !!shift }; };
+  for (let i = 0; i < 26; i++) {
+    const lo = String.fromCharCode(97 + i), up = String.fromCharCode(65 + i);
+    add(lo, 'Key' + up, 65 + i, false);
+    add(up, 'Key' + up, 65 + i, true);
+  }
+  const sh = ')!@#$%^&*(';
+  for (let d = 0; d < 10; d++) {
+    add(String(d), 'Digit' + d, 48 + d, false);
+    add(sh[d], 'Digit' + d, 48 + d, true);
+  }
+  add(' ', 'Space', 32, false);
+  const punct = [
+    ['`', '~', 'Backquote', 192], ['-', '_', 'Minus', 189], ['=', '+', 'Equal', 187],
+    ['[', '{', 'BracketLeft', 219], [']', '}', 'BracketRight', 221], ['\\', '|', 'Backslash', 220],
+    [';', ':', 'Semicolon', 186], ["'", '"', 'Quote', 222], [',', '<', 'Comma', 188],
+    ['.', '>', 'Period', 190], ['/', '?', 'Slash', 191],
+  ];
+  for (const [lo, hi, code, vk] of punct) { add(lo, code, vk, false); add(hi, code, vk, true); }
+  return m;
+}
+const KEYMAP = buildKeyMap();
+const SHIFT_DESC = { code: 'ShiftLeft', vk: 16, key: 'Shift' };          // no text
+const BACKSPACE_DESC = { code: 'Backspace', vk: 8, key: 'Backspace' };   // no text
+
+async function dispatchKey(cdp, desc, type, shiftActive, ts) {
+  const ev = {
+    type,
+    windowsVirtualKeyCode: desc.vk,
+    code: desc.code,
+    key: desc.key,
+    modifiers: shiftActive ? 8 : 0,   // 8 = Shift
+  };
+  if (ts != null) ev.timestamp = ts;
+  if (type === 'keyDown' && desc.text) ev.text = desc.text;
+  await cdp.send('Input.dispatchKeyEvent', ev);
+}
+
+// Emit a single key as down → (precise dwell) → up. The dwell the page observes
+// is encoded in the keyUp `timestamp` (keyDown base + exact dwell), so it is a
+// continuous value rather than one snapped to Windows' 15.6ms setTimeout tick —
+// the wall-clock sleep used for pacing may quantize, but the page never sees it.
+async function emitKey(cdp, desc, dwellMs, shiftActive) {
+  const base = Date.now() / 1000;
+  await dispatchKey(cdp, desc, 'keyDown', shiftActive, base);
+  await sleep(dwellMs);
+  await dispatchKey(cdp, desc, 'keyUp', shiftActive, base + dwellMs / 1000);
+}
+
+// Emit a printable char, managing the Shift run: Shift is pressed slightly
+// before the first shifted char and held across consecutive shifted chars
+// (as a real typist does), released when a non-shifted char arrives.
+async function emitChar(cdp, desc, dwellMs, state, rng) {
+  if (desc.shift && !state.shift) {
+    await dispatchKey(cdp, SHIFT_DESC, 'keyDown', true, Date.now() / 1000);
+    state.shift = true;
+    await sleep(logNormal(rng, 55, 0.35, 20, 160));   // shift lead
+  } else if (!desc.shift && state.shift) {
+    await dispatchKey(cdp, SHIFT_DESC, 'keyUp', false, Date.now() / 1000);
+    state.shift = false;
+    await sleep(logNormal(rng, 45, 0.35, 15, 140));
+  }
+  await emitKey(cdp, desc, dwellMs, state.shift);
+}
+
+// Legacy fallback (only if a CDP session can't be created): the original
+// press-based path. Retains the Shift-event gap but keeps the tool functional
+// in environments without CDP.
+async function legacyType(page, text, rng, typosEnabled) {
+  let prev = '';
+  let burst = 1.0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const base = charBaseMs(ch);
+    if (/[a-z]/.test(ch)) burst = Math.max(0.65, burst * (rng() < 0.3 ? 0.9 : 1.0));
+    else burst = Math.min(1.15, burst + 0.05);
+    let delay = logNormal(rng, base * burst, 0.35, 30, 500);
+    if (prev === ' ' && ch !== ' ') delay += logNormal(rng, 80, 0.4, 20, 300);
+    if (/[.,;:!?]/.test(prev)) delay += logNormal(rng, 120, 0.4, 30, 450);
+    if (i > 1 && rng() < 0.015) delay += logNormal(rng, 650, 0.5, 200, 2200);
+    await sleep(delay);
+    const wrong = typosEnabled && i > 0 && rng() < 0.008 ? pickTypo(ch, rng) : null;
+    if (wrong) {
+      await page.keyboard.press(wrong, { delay: Math.round(logNormal(rng, 55, 0.3, 20, 130)) });
+      await sleep(logNormal(rng, 220, 0.4, 90, 700));
+      await page.keyboard.press('Backspace', { delay: Math.round(logNormal(rng, 45, 0.3, 20, 110)) });
+      await sleep(logNormal(rng, 140, 0.3, 60, 400));
+    }
+    await page.keyboard.press(ch, { delay: Math.round(logNormal(rng, 55, 0.3, 20, 130)) });
+    prev = ch;
+  }
+}
+
 // Type a string one char at a time with realistic inter-key gaps, per-key
-// dwell, burstiness, and optional typo-then-correct patterns. `opts.typos`:
+// dwell, burstiness, explicit Shift handling, and optional typo-then-correct
+// patterns. `opts.typos`:
 //   'off'  — never insert typos (use for passwords, credentials)
 //   'on'   — ~0.8% per char
 //   'auto' — default; detects password fields and disables typos for them
@@ -455,36 +630,55 @@ async function humanType(page, text, opts = {}) {
     } catch { typosEnabled = false; }
   }
 
+  const cdp = await getCdpSession(page);
+  if (!cdp) return legacyType(page, text, rng, typosEnabled);
+
+  const state = { shift: false };
   let prev = '';
   let burst = 1.0;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    const base = charBaseMs(ch);
+  try {
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      const desc = KEYMAP[ch];
+      const base = charBaseMs(ch);
 
-    if (/[a-z]/.test(ch)) burst = Math.max(0.65, burst * (rng() < 0.3 ? 0.9 : 1.0));
-    else burst = Math.min(1.15, burst + 0.05);
+      if (/[a-z]/.test(ch)) burst = Math.max(0.65, burst * (rng() < 0.3 ? 0.9 : 1.0));
+      else burst = Math.min(1.15, burst + 0.05);
 
-    let delay = logNormal(rng, base * burst, 0.35, 30, 500);
-    if (prev === ' ' && ch !== ' ') delay += logNormal(rng, 80, 0.4, 20, 300);
-    if (/[.,;:!?]/.test(prev)) delay += logNormal(rng, 120, 0.4, 30, 450);
-    if (i > 1 && rng() < 0.015) delay += logNormal(rng, 650, 0.5, 200, 2200);
+      let delay = logNormal(rng, base * burst, 0.35, 30, 500);
+      if (prev === ' ' && ch !== ' ') delay += logNormal(rng, 80, 0.4, 20, 300);
+      if (/[.,;:!?]/.test(prev)) delay += logNormal(rng, 120, 0.4, 30, 450);
+      if (i > 1 && rng() < 0.015) delay += logNormal(rng, 650, 0.5, 200, 2200);
+      await sleep(delay);
 
-    await sleep(delay);
+      // char not in the physical-key map (emoji, accented letters, CJK):
+      // release any held Shift and fall back to Playwright's press for it.
+      if (!desc) {
+        if (state.shift) { await dispatchKey(cdp, SHIFT_DESC, 'keyUp', false, Date.now() / 1000); state.shift = false; }
+        await page.keyboard.press(ch, { delay: Math.round(logNormal(rng, 55, 0.3, 20, 130)) });
+        prev = ch;
+        continue;
+      }
 
-    // typo insertion: press wrong neighbor, small pause noticing, Backspace, then correct
-    const wrong = typosEnabled && i > 0 && rng() < 0.008 ? pickTypo(ch, rng) : null;
-    if (wrong) {
-      const holdW = logNormal(rng, 55, 0.3, 20, 130);
-      await page.keyboard.press(wrong, { delay: Math.round(holdW) });
-      await sleep(logNormal(rng, 220, 0.4, 90, 700));   // "noticing" pause
-      const holdB = logNormal(rng, 45, 0.3, 20, 110);
-      await page.keyboard.press('Backspace', { delay: Math.round(holdB) });
-      await sleep(logNormal(rng, 140, 0.3, 60, 400));
+      // typo: emit a wrong neighbour, notice, Backspace, then the real char.
+      const wrongCh = typosEnabled && i > 0 && rng() < 0.008 ? pickTypo(ch, rng) : null;
+      const wrongDesc = wrongCh ? KEYMAP[wrongCh] : null;
+      if (wrongDesc) {
+        await emitChar(cdp, wrongDesc, logNormal(rng, 60, 0.3, 25, 140), state, rng);
+        await sleep(logNormal(rng, 220, 0.4, 90, 700));                 // "noticing" pause
+        await emitKey(cdp, BACKSPACE_DESC, logNormal(rng, 50, 0.3, 20, 120), state.shift);
+        await sleep(logNormal(rng, 140, 0.3, 60, 400));
+      }
+
+      await emitChar(cdp, desc, logNormal(rng, 62, 0.3, 25, 140), state, rng);
+      prev = ch;
     }
-
-    const holdMs = logNormal(rng, 55, 0.3, 20, 130);
-    await page.keyboard.press(ch, { delay: Math.round(holdMs) });
-    prev = ch;
+  } finally {
+    // never leave Shift logically stuck, even if something threw mid-string
+    if (state.shift) {
+      try { await dispatchKey(cdp, SHIFT_DESC, 'keyUp', false, Date.now() / 1000); } catch { /* ignore */ }
+      state.shift = false;
+    }
   }
 }
 
@@ -544,7 +738,11 @@ function thinkMs(opts = {}) {
   const rng = opts.rng || Math.random;
   const scale = opts.mean ? opts.mean / 450 : 1;
   const r = rng();
-  if (r < 0.15) return 0;                                     // 15% skip
+  // Fast hand-off: a brief but NON-ZERO pause. Returning exactly 0 here put a
+  // point-mass spike at 0 in the action-spacing histogram (a fittable artifact);
+  // a real person essentially never fires two deliberate actions with truly 0ms
+  // between them.
+  if (r < 0.15) return logNormal(rng, 55 * scale, 0.5, 8, 220 * scale);  // 15% fast
   if (r < 0.75) return logNormal(rng, 320 * scale, 0.35, 80, 900);   // short
   if (r < 0.95) return logNormal(rng, 750 * scale, 0.4, 300, 1800);  // medium
   return logNormal(rng, 1800 * scale, 0.45, 700, 4500);              // longer
@@ -555,10 +753,12 @@ async function think(opts = {}) {
   if (ms > 0) await sleep(ms);
 }
 
-// "clear this text field the way a human would" — triple-click selects the
-// whole line/paragraph in Chrome for inputs and most contenteditables, which
-// is what users do when replacing a value. Falls back to Ctrl+A for edge
-// cases where triple-click's selection didn't cover everything.
+// "clear this text field the way a human would". The selection GESTURE is
+// randomized each call so the field-edit doesn't emit a byte-identical
+// triple-click+Ctrl+A+Delete macro every time (a repeatable behavioral
+// signature). Whatever the gesture, we always finish with Ctrl+A before the
+// delete key so the field is reliably emptied for inputs, multi-line
+// textareas, and React-controlled contenteditables alike.
 async function humanClearField(page, locator, opts = {}) {
   const rng = opts.rng || Math.random;
   const timeout = opts.timeout || 30000;
@@ -568,19 +768,24 @@ async function humanClearField(page, locator, opts = {}) {
     rng, targetW: Math.min(box.width, box.height),
   });
   await sleep(logNormal(rng, 50, 0.3, 20, 150));
-  // triple-click to select all
-  await page.mouse.down(); await sleep(logNormal(rng, 40, 0.25, 15, 100));
-  await page.mouse.up();   await sleep(logNormal(rng, 70, 0.25, 30, 150));
-  await page.mouse.down(); await sleep(logNormal(rng, 40, 0.25, 15, 100));
-  await page.mouse.up();   await sleep(logNormal(rng, 70, 0.25, 30, 150));
-  await page.mouse.down(); await sleep(logNormal(rng, 40, 0.25, 15, 100));
-  await page.mouse.up();
+
+  // Pick how many times to click before the select-all: triple (select line),
+  // double (select word), single (just focus/caret), or none (move only).
+  const r = rng();
+  const clicks = r < 0.5 ? 3 : r < 0.75 ? 1 : r < 0.92 ? 2 : 0;
+  for (let i = 0; i < clicks; i++) {
+    await page.mouse.down(); await sleep(logNormal(rng, 40, 0.25, 15, 100));
+    await page.mouse.up();
+    if (i + 1 < clicks) await sleep(logNormal(rng, 70, 0.25, 30, 150));
+  }
   await sleep(logNormal(rng, 80, 0.3, 30, 180));
-  // belt-and-braces: Ctrl+A covers cases where triple-click didn't cover all
-  // (multi-line textarea, some React-controlled fields)
+
+  // Reliable select-all, then a delete key chosen at random (Delete vs
+  // Backspace — both empty a fully-selected field; real users use either).
   await page.keyboard.press('Control+A', { delay: Math.round(logNormal(rng, 50, 0.2, 25, 100)) });
   await sleep(logNormal(rng, 70, 0.3, 25, 180));
-  await page.keyboard.press('Delete', { delay: Math.round(logNormal(rng, 55, 0.25, 25, 120)) });
+  const delKey = rng() < 0.5 ? 'Delete' : 'Backspace';
+  await page.keyboard.press(delKey, { delay: Math.round(logNormal(rng, 55, 0.25, 25, 120)) });
 }
 
 // --------------------------------------------------------------------------
