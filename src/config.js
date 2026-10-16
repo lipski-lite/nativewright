@@ -60,7 +60,29 @@ function nativewrightHome() {
   return path.join(xdg, 'nativewright');
 }
 
-const ROOT_DIR        = nativewrightHome();
+/**
+ * Named profile selected for this process (`--profile=<name>` on the CLI,
+ * or NATIVEWRIGHT_PROFILE). `null` means the default profile.
+ *
+ * A named profile is a fully separate browser identity: its own data root
+ * `<home>/profiles/<name>/` holding its own lockfile, logs and Chrome
+ * profile — so it runs as its own daemon, with its own cookies, extensions
+ * and network settings, and never touches the default profile's sessions.
+ *
+ * @returns {string|null}
+ */
+function profileName() {
+  const v = envAny('PROFILE');
+  if (!v || v === 'default') return null;
+  if (!/^[a-z0-9][a-z0-9_-]{0,31}$/i.test(v)) {
+    throw new Error(`invalid profile name '${v}' (letters, digits, '-' and '_', max 32 chars)`);
+  }
+  return v.toLowerCase();
+}
+
+const PROFILE         = profileName();
+const BASE_HOME       = nativewrightHome();
+const ROOT_DIR        = PROFILE ? path.join(BASE_HOME, 'profiles', PROFILE) : BASE_HOME;
 const LOCK_FILE       = path.join(ROOT_DIR, 'daemon.json');
 const INSTALL_FILE    = path.join(ROOT_DIR, 'install.json');
 const LOG_DIR         = path.join(ROOT_DIR, 'logs');
@@ -86,6 +108,11 @@ const IDLE_EXIT_MS = (() => {
  * @returns {string}
  */
 function userDataDir() {
+  // A named profile always owns its directory: NATIVEWRIGHT_USER_DATA_DIR is
+  // commonly set machine-wide to point at the DEFAULT profile, and honouring
+  // it here would make a named-profile daemon fight the default daemon for
+  // the same Chrome profile lock.
+  if (PROFILE) return DEFAULT_PROFILE;
   return envAny('USER_DATA_DIR') || DEFAULT_PROFILE;
 }
 
@@ -311,6 +338,7 @@ function appendLog(line) {
 }
 
 module.exports = {
+  PROFILE, BASE_HOME,
   ROOT_DIR, LOCK_FILE, INSTALL_FILE, LOG_DIR, LOG_FILE, DEFAULT_PROFILE, IDLE_EXIT_MS,
   envAny, nativewrightHome, userDataDir, artifactsDir, chromeExecutable, ensureDir,
   readLockfile, writeLockfile, deleteLockfile, writeInstallFile,

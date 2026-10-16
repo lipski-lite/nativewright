@@ -324,6 +324,7 @@ function createSession() {
       keeper: !!_keeper && !_keeper.isClosed(),
       idleExitMs: cfg.IDLE_EXIT_MS,
       idleTimerArmed: !!idleTimer,
+      profile: cfg.PROFILE || 'default',
       userDataDir: cfg.userDataDir(),
       commandLog: commandLog.slice(-20),
     };
@@ -550,6 +551,7 @@ async function runDaemon({ scriptPath }) {
   await cfg.writeLockfile({
     pid: process.pid,
     port,
+    profile: cfg.PROFILE || 'default',
     userDataDir: cfg.userDataDir(),
     startedAt: new Date().toISOString(),
     scriptPath,
@@ -558,7 +560,7 @@ async function runDaemon({ scriptPath }) {
   await cfg.writeInstallFile(scriptPath);
   cfg.appendLog(`daemon listening pid=${process.pid} port=${port}`);
   process.stdout.write(
-    `nativewright daemon ready pid=${process.pid} port=${port} ` +
+    `nativewright daemon ready profile=${cfg.PROFILE || 'default'} pid=${process.pid} port=${port} ` +
     `userDataDir="${cfg.userDataDir()}" idleExitMs=${cfg.IDLE_EXIT_MS}\n`
   );
 

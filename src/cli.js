@@ -247,13 +247,13 @@ async function runStop(flags = {}) {
 
 async function runStatus(flags) {
   const lock = await cfg.readLockfile();
-  if (!lock) { process.stdout.write(JSON.stringify({ running: false }, null, 2) + '\n'); return; }
+  if (!lock) { process.stdout.write(JSON.stringify({ running: false, profile: cfg.PROFILE || 'default' }, null, 2) + '\n'); return; }
   const alive = await cfg.verifyLockfile(lock);
   if (!alive) {
     process.stdout.write(JSON.stringify({ running: false, stale: true, lock }, null, 2) + '\n');
     return;
   }
-  const base = { running: true, pid: lock.pid, port: lock.port, userDataDir: lock.userDataDir, startedAt: lock.startedAt };
+  const base = { running: true, profile: lock.profile || 'default', pid: lock.pid, port: lock.port, userDataDir: lock.userDataDir, startedAt: lock.startedAt };
   try {
     const { body } = await post(lock.port, '/cmd', { cmd: 'state', args: {}, cwd: process.cwd() });
     const st = body && body.result ? body.result : null;

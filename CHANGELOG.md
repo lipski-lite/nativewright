@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-10-16
+
+### Added
+- **Named profiles.** `--profile=<name>` on any command (or `NATIVEWRIGHT_PROFILE=<name>`) selects a separate browser identity that runs as its own daemon, with its own Chrome profile, cookies, extensions, lockfile and logs under `<data root>/profiles/<name>/`. The default profile is unaffected. Names: letters, digits, `-`, `_`, up to 32 chars. A named profile always owns its own Chrome profile directory (`NATIVEWRIGHT_USER_DATA_DIR` applies to the default profile only, so a machine-wide setting can't make two daemons fight over one profile lock).
+- `status`, `state` and the lockfile report the active `profile`.
+- **`nativewright-vpn` skill** — the "blocked by IP" workflow: detect a per-IP limit, move the task into a dedicated `vpn` profile, turn its browser VPN on, verify the new exit IP, retry there; with a version guard, coordination rules for shared VPN state, and a 3-country cap.
+- `nativewright` and `nativewright-login-bootstrap` skills document profiles.
+
+### Fixed
+- Smoke test no longer depends on an external site: it serves its own fixture page from a child process (example.com dropped its `<h1>` and asks not to be used for testing, which broke the test and CI).
+
 ## [2.0.0] — 2026-09-02
 
 Multi-agent release. Any number of clients can now share one daemon safely,

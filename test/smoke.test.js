@@ -52,6 +52,20 @@ const childEnv = {
 delete childEnv.NATIVEWRIGHT_PAGE;
 delete childEnv.PATCHRIGHT_PAGE;
 
+// Local HTTP fixture: the test must not depend on any external site (public
+// "example" domains change their markup and ask not to be used for testing).
+// The fixture runs in its OWN process: the CLI calls below use spawnSync,
+// which blocks this process's event loop — an in-process server could not
+// answer the browser while a command waits on it.
+const FIXTURE_SRC = `
+  const http = require('http');
+  const html = '<!doctype html><meta charset=utf-8><title>NativeWright Smoke</title>' +
+    '<h1>Smoke Fixture</h1><p>local test page</p>';
+  const s = http.createServer((q, r) => { r.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'}); r.end(html); });
+  s.listen(0, '127.0.0.1', () => process.stdout.write('PORT ' + s.address().port + '\\n'));
+`;
+let FIXTURE_URL = null; // set once the server is listening
+
 // CLI helper: synchronous call, returns parsed JSON result (or throws).
 function cli(args, { timeout = 60_000 } = {}) {
   const res = spawnSync(process.execPath, [ENTRY, ...args], {
@@ -76,6 +90,15 @@ function cli(args, { timeout = 60_000 } = {}) {
 let daemon; // child_process handle
 
 test('daemon boots, pages are isolated leases, commands roundtrip, stops cleanly', async (t) => {
+  const fixture = spawn(process.execPath, ['-e', FIXTURE_SRC], { stdio: ['ignore', 'pipe', 'inherit'] });
+  t.after(() => { try { fixture.kill(); } catch {} });
+  const port = await new Promise((resolve, reject) => {
+    let buf = '';
+    fixture.stdout.on('data', (c) => { buf += c; const m = /PORT (\d+)/.exec(buf); if (m) resolve(m[1]); });
+    fixture.once('exit', (code) => reject(new Error('fixture server exited early: ' + code)));
+  });
+  FIXTURE_URL = `http://127.0.0.1:${port}/`;
+
   // 1. start in background
   daemon = spawn(process.execPath, [ENTRY, 'start'], {
     env: childEnv,
@@ -127,21 +150,21 @@ test('daemon boots, pages are isolated leases, commands roundtrip, stops cleanly
   assert.match(PAGE, /^p\d+$/, `unexpected page id: ${PAGE}`);
   assert.strictEqual(created.body.result.label, 'smoke');
 
-  // 3d. goto example.com on that page
-  const goto = cli(['goto', 'https://example.com/', `--page=${PAGE}`]);
+  // 3d. goto the local fixture on that page
+  const goto = cli(['goto', FIXTURE_URL, `--page=${PAGE}`]);
   assert.strictEqual(goto.exitCode, 0,
     `goto failed: ${JSON.stringify(goto.body)}\nstderr: ${goto.stderr}`);
   assert.strictEqual(goto.body.ok, true);
   assert.strictEqual(goto.body.page, PAGE, 'response should echo the targeted page');
-  assert.match(goto.body.result.url, /example\.com/);
+  assert.match(goto.body.result.url, /127\.0\.0\.1/);
 
-  // 3e. text h1 -> "Example Domain" (lone page: --page may be omitted)
+  // 3e. text h1 -> "Smoke Fixture" (lone page: --page may be omitted)
   const txt = cli(['text', 'h1']);
   assert.strictEqual(txt.exitCode, 0,
     `text failed: ${JSON.stringify(txt.body)}\nstderr: ${txt.stderr}`);
   assert.strictEqual(txt.body.ok, true);
   assert.strictEqual(txt.body.page, PAGE);
-  assert.match(txt.body.result.text, /Example Domain/i);
+  assert.match(txt.body.result.text, /Smoke Fixture/);
 
   // 3f. shot produces a non-empty PNG
   const shot = cli(['shot', 'smoke', `--page=${PAGE}`]);
@@ -160,7 +183,7 @@ test('daemon boots, pages are isolated leases, commands roundtrip, stops cleanly
     `eval-file failed: ${JSON.stringify(ef.body)}\nstderr: ${ef.stderr}`);
   assert.strictEqual(ef.body.ok, true);
   assert.strictEqual(ef.body.result.value.two, 2, 'eval-file did not evaluate the expression');
-  assert.match(ef.body.result.value.title, /Example Domain/i, 'eval-file did not run in the page context');
+  assert.match(ef.body.result.value.title, /NativeWright Smoke/, 'eval-file did not run in the page context');
 
   // 3h. eval-file on a missing file -> ok:false, daemon stays alive.
   const efMissing = cli(['eval-file', path.join(TMP_ARTIFACTS, 'nope.js'), `--page=${PAGE}`]);
@@ -188,7 +211,7 @@ test('daemon boots, pages are isolated leases, commands roundtrip, stops cleanly
   // 4b. each page still addressable, independently
   const t1 = cli(['title', `--page=${PAGE}`]);
   assert.strictEqual(t1.body.ok, true);
-  assert.match(t1.body.result.title, /Example Domain/i);
+  assert.match(t1.body.result.title, /NativeWright Smoke/);
   const t2 = cli(['title', `--page=${PAGE2}`]);
   assert.strictEqual(t2.body.ok, true);
   assert.strictEqual(t2.body.result.title, '', 'fresh about:blank page should have an empty title');
@@ -198,7 +221,7 @@ test('daemon boots, pages are isolated leases, commands roundtrip, stops cleanly
     env: { ...childEnv, NATIVEWRIGHT_PAGE: PAGE }, encoding: 'utf8', timeout: 30_000,
   });
   assert.strictEqual(pinned.status, 0, `env-pinned call failed: ${pinned.stdout} ${pinned.stderr}`);
-  assert.match(JSON.parse(pinned.stdout).result.url, /example\.com/);
+  assert.match(JSON.parse(pinned.stdout).result.url, /127\.0\.0\.1/);
 
   // 4d. closing the second page leaves the first id intact (ids are stable)
   const closed2 = cli(['close', `--page=${PAGE2}`]);

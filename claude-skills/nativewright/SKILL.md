@@ -204,7 +204,18 @@ Cookies, localStorage, and IndexedDB survive daemon restarts. Sessions on mature
 
 **Never open a normal Chrome window pointed at the same profile directory.** Chrome holds a profile lock; a second opener will fail or corrupt state. If `start` fails with a profile-lock error, a real Chrome (or a zombie daemon Chrome) is using the directory — close it, check `tasklist | findstr chrome` (Windows) or `pgrep -fl chrome` (Unix), then retry.
 
-**One daemon per profile.** All agents working under the same logged-in identity share one daemon (each with their own page). Distinct identities/accounts need distinct profiles → distinct daemons via separate `NATIVEWRIGHT_HOME` roots.
+**One daemon per profile.** All agents working under the same logged-in identity share one daemon (each with their own page). A different identity / network setup is a different **named profile**: put `--profile=<name>` on every command (`start`, `status`, `new`, `goto`, …) and it runs as its own daemon with its own Chrome profile, cookies, extensions and lockfile under `<data root>/profiles/<name>/`. Without the flag you are on the default (logged-in) profile.
+
+| Profile | What it is | Use for |
+|---|---|---|
+| default (no flag) | the human's logged-in accounts, one stable IP | everything normal |
+| `vpn` | no accounts; Browsec VPN installed (Proton / Windscribe installed but not logged in) | anything blocked **by IP** — see the `nativewright-vpn` skill |
+
+Requires nativewright ≥ 2.1.0: `nativewright status --profile=vpn` must print `"profile": "vpn"`. Older versions ignore the flag and would run in the default profile — stop and report if the field is missing.
+
+## Blocked by IP? → `nativewright-vpn`
+
+If a page says *"Daily limit reached … from your IP"*, *"too many requests"*, returns HTTP 429 for a per-IP quota, or the task needs another country: **do not** try anything in the default profile. Switch to the `nativewright-vpn` skill — it moves the task into the `vpn` profile, turns the VPN on, verifies the new IP and retries there. CAPTCHA / "unusual traffic" pages are NOT this case — hand those to the human.
 
 ## First-run login
 

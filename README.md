@@ -232,7 +232,21 @@ NativeWright is designed to be driven by agents. The pattern is identical across
 
 Any number of agents can share one daemon. There is **no shared "active page"**: every command names its page, and the daemon binds it to that page inside the page's own queue, so concurrent agents can never clobber each other. Page ids are stable and never re-indexed when another page closes; frame scope, dialog policy and console/network buffers are per page; commands on different pages run concurrently. If more than one page is open and you omit `--page`, the daemon **refuses** with a clear error rather than guessing. Each page lives in its own window, so it stays a foreground, `visibilityState: 'visible'` page even when other windows overlap it (background *tabs* would be hidden and throttled). Artifacts are written under the **caller's** working directory, so agents in different projects don't mix files. In a persistent shell you can pin your page once with `NATIVEWRIGHT_PAGE=p3` instead of repeating the flag.
 
-One daemon serves one profile (identity). Distinct identities need distinct profiles → separate `NATIVEWRIGHT_HOME` roots.
+One daemon serves one profile (identity).
+
+### Named profiles
+
+A separate browser identity is one flag away: put `--profile=<name>` on every command and it runs as its **own daemon** with its own Chrome profile, cookies, extensions and lockfile under `<data root>/profiles/<name>/`. The default profile is untouched. Typical use: a `vpn` profile with a browser VPN extension installed, so work that needs a different IP never changes the IP of the default profile's logged-in sessions — and never affects other agents' pages there.
+
+```bash
+nativewright start --profile=vpn &
+nativewright wait-ready --profile=vpn
+nativewright new --profile=vpn --label=job          # → p1 (in the vpn profile)
+nativewright goto https://example.org --profile=vpn --page=p1
+nativewright status --profile=vpn                   # → "profile": "vpn"
+```
+
+`NATIVEWRIGHT_PROFILE=<name>` does the same for a whole shell. A named profile always owns its own Chrome profile directory — `NATIVEWRIGHT_USER_DATA_DIR` applies to the default profile only. The bundled `nativewright-vpn` Claude Code skill documents the full "blocked by IP → switch to the vpn profile" workflow.
 
 ### Claude Code
 
@@ -299,6 +313,7 @@ All page commands accept `--page=<id>` (required whenever more than one page is 
 | `NATIVEWRIGHT_USER_DATA_DIR` | persistent browser profile path | `<HOME>/profile/default` |
 | `NATIVEWRIGHT_ARTIFACTS_DIR` | force one screenshot & bundle output directory | the **caller's** `./artifacts` |
 | `NATIVEWRIGHT_PAGE` | default `--page` for a shell (explicit flag wins) | unset |
+| `NATIVEWRIGHT_PROFILE` | named profile for a shell (same as `--profile=<name>`) | default profile |
 | `NATIVEWRIGHT_IDLE_EXIT_MS` | graceful exit after the last page has been closed this long; `0` = never | `600000` (10 min) |
 | `NATIVEWRIGHT_CHROME_PATH` | explicit browser binary path | auto-detected |
 | `NATIVEWRIGHT_CHANNEL` | Patchright channel | `chrome` |

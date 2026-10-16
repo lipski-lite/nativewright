@@ -98,6 +98,10 @@ nativewright stop
 If `stop` is refused because other agents still have pages open, do **not** force it. The session is still safe: Chrome persists cookies continuously while running, and the daemon exits gracefully (a full flush) once the last page has been closed for the idle period. Never kill the daemon any other way (Ctrl+C, taskkill) — an unclean exit is the one path that can lose the new login.
 </HARD-GATE>
 
+### Logging in inside a named profile
+
+Sessions do not carry over between profiles. To log a site in inside a named profile (e.g. the `vpn` profile used by `nativewright-vpn`), run this exact procedure with `--profile=<name>` added to EVERY command (`status`, `start`, `wait-ready`, `new`, `goto`, `close`, `stop`). The cookies then live only in that profile.
+
 ## Critical rules
 
 - **Never open the profile in a normal Chrome window.** Chrome holds an exclusive lock on a profile directory; opening it a second time will corrupt the profile or fail loudly. The NativeWright daemon IS the owner while running.
