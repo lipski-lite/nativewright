@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nw-scroll</title>
+<style>
+  /* a single-page-app layout: the DOCUMENT never scrolls, an inner panel does (Gemini, most apps) */
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 14px system-ui, sans-serif; }
+  #panel { position: absolute; left: 20px; top: 20px; width: 400px; height: 280px; overflow-y: auto; border: 1px solid #888; background: #fff; }
+  #panel .inner { height: 6000px; background: linear-gradient(#ffffff, #b8c4d8); padding-top: 10px; }
+  #hs { position: absolute; left: 20px; top: 320px; width: 400px; height: 90px; overflow-x: auto; overflow-y: hidden; border: 1px solid #888; }
+  #hs .wide { width: 4000px; height: 60px; background: repeating-linear-gradient(90deg, #eee 0 100px, #d6dcea 100px 200px); }
+  #side { position: absolute; left: 450px; top: 20px; width: 150px; height: 150px; overflow: auto; border: 1px solid #888; }
+  #side .inner { height: 1500px; background: #f4efe0; }
+  #lock { position: absolute; left: 450px; top: 200px; width: 150px; height: 100px; overflow: hidden; border: 1px solid #888; }
+</style>
+<div id="panel"><div class="inner">inner panel</div></div>
+<div id="hs"><div class="wide"></div></div>
+<div id="side"><div class="inner">side</div></div>
+<div id="lock">overflow hidden (a wheel handler, no native scrolling)</div>
+<div id="log" hidden></div>
+<script>
+  window.rec = (...a) => { const i = document.createElement('i'); i.textContent = JSON.stringify(a); document.getElementById('log').appendChild(i); };
+  let n = 0;
+  document.addEventListener('wheel', (e) => {
+    n++; document.documentElement.dataset.wheels = n;
+    rec('w', e.deltaX, e.deltaY, e.deltaMode, e.isTrusted, Math.round(e.timeStamp * 10) / 10);
+  }, { capture: true, passive: true });
+  document.getElementById('lock').addEventListener('wheel', () => { document.documentElement.dataset.lockWheels = String((+document.documentElement.dataset.lockWheels || 0) + 1); }, { passive: true });
+</script>

@@ -41,7 +41,14 @@ const http = require('http');
 const { chromium } = require('patchright');
 
 const cfg = require('./config');
+const human = require('./human');
+const timing = require('./timing');
+const wheel = require('./wheel');
 const { commands, PAGELESS } = require('./commands');
+
+// A touch-only (tablet-class) device reports 10 simultaneous contacts; `hasTouch`
+// alone reports 1, which would contradict a two-finger pinch.
+const TOUCH_MAX_POINTS = 10;
 
 // In-page hook that survives Patchright's suppression of `Runtime.enable` /
 // `Console.enable`. Re-injected after every navigation.
@@ -100,6 +107,8 @@ function createSession() {
   let _consoleInit = null;
   let _keeper = null;
   let _shutdown = null;
+  let _headless = false;
+  let _touch = false;
   let idleTimer = null;
   const commandLog = [];
   const startedAt = new Date().toISOString();
@@ -244,6 +253,7 @@ function createSession() {
     const rec = adoptPage(page, { label: opts.label, cwd: opts.cwd });
     if (opts.label != null && !rec.label) rec.label = opts.label;
     if (opts.cwd && !rec.cwd) rec.cwd = opts.cwd;
+    await applyTouch(page);       // before the caller can navigate: no page ever sees the intermediate maxTouchPoints
     try {
       const k = (windowSlot++) % 8;
       rec.windowId = await setWindowBounds(page, {
@@ -292,10 +302,30 @@ function createSession() {
       opener: r.opener,
       cwd: r.cwd,
       createdAt: r.createdAt,
+      // where the pointer is and what is still held (a forgotten hold must be visible)
+      input: human.inputSnapshot(r.page),
     }));
   }
 
+  /**
+   * Touch-capable configuration (NATIVEWRIGHT_TOUCH=1): the context is launched
+   * with hasTouch, and every page is raised from maxTouchPoints=1 to 10 over its
+   * (kept-open) CDP session. The override is per page target and per session, so
+   * the session is the page's cached one and is never detached.
+   */
+  async function applyTouch(page) {
+    if (!_touch) return;
+    try {
+      const cdp = await human.getCdpSession(page);
+      if (cdp) await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: TOUCH_MAX_POINTS });
+    } catch (e) { cfg.appendLog(`touch emulation failed: ${e.message}`); }
+  }
+
   async function closePage(rec) {
+    // never leave a button or key logically down behind a closing page (best effort, bounded)
+    try {
+      await Promise.race([human.releaseAll(rec.page), new Promise((r) => setTimeout(r, 3000))]);
+    } catch { /* the page may already be gone */ }
     await rec.page.close();
     return { closed: rec.id, remaining: pages.size };
   }
@@ -317,11 +347,17 @@ function createSession() {
   }
 
   function snapshot() {
+    const cal = wheel.calibrationStatus();
     return {
       startedAt,
       pageCount: pages.size,
       pages: listPages(),
       keeper: !!_keeper && !_keeper.isClosed(),
+      headless: _headless,
+      touch: _touch,
+      // the wheel model scrolling uses ('default' | 'human') and what calibration file is on disk
+      wheelModel: cal.model,
+      wheelCalibration: cal.calibration,
       idleExitMs: cfg.IDLE_EXIT_MS,
       idleTimerArmed: !!idleTimer,
       profile: cfg.PROFILE || 'default',
@@ -341,6 +377,11 @@ function createSession() {
     setBrowserCdp(s) { _browserCdp = s; },
     setConsoleInit(src) { _consoleInit = src; },
     setShutdown(fn) { _shutdown = fn; onPagesChanged(); },
+    setHeadless(v) { _headless = !!v; },
+    setTouch(v) { _touch = !!v; },
+    isHeadless: () => _headless,
+    touchEnabled: () => _touch,
+    applyTouch,
     ensureConsoleHook,
     adoptPage, findRec, newPage, resolve, frameOf, listPages, closePage,
     setupKeeper, metaQueue, snapshot, logCommand,
@@ -381,6 +422,31 @@ function send(res, code, obj) {
   res.end(body);
 }
 
+// ---------- event clock -----------------------------------------------------
+
+/**
+ * Pin the browser's clock offset to the event clock (timing.pinClock) on the daemon's own keeper page. Only a blank page
+ * qualifies: if the profile restored a website into the first window, the pin is skipped (the first coalesced pointer
+ * burst then freezes Chrome's offset a moment later, which is a sub-millisecond difference). Never throws; never hangs.
+ */
+async function pinEventClock(page) {
+  try {
+    const url = page.url();
+    if (url !== 'about:blank' && !/^chrome:\/\/(new-?tab|newtab-page|new-tab-page)/.test(url)) {
+      cfg.appendLog(`event clock not pinned on the first page (${url.split('/')[0]}//…): it is not the daemon's own blank page`);
+      return;
+    }
+    const cdp = await human.getCdpSession(page);
+    if (!cdp) throw new Error('no CDP session on the keeper page');
+    let timer;
+    const limit = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timed out after 5000 ms')), 5000); });
+    try { await Promise.race([timing.pinClock(cdp), limit]); } finally { clearTimeout(timer); }
+    cfg.appendLog('event clock pinned');
+  } catch (e) {
+    cfg.appendLog(`event clock pin failed (not fatal): ${e.message}`);
+  }
+}
+
 // ---------- daemon entry ----------------------------------------------------
 
 async function runDaemon({ scriptPath }) {
@@ -408,7 +474,10 @@ async function runDaemon({ scriptPath }) {
   // ---- launch browser ----------------------------------------------------
   cfg.appendLog(`daemon starting; userDataDir=${cfg.userDataDir()} idleExitMs=${cfg.IDLE_EXIT_MS}`);
   const headless = envFlag('HEADLESS');
+  const touchMode = envFlag('TOUCH');
   const channel  = cfg.envAny('CHANNEL') || 'chrome';
+  session.setHeadless(headless);
+  session.setTouch(touchMode);
 
   /** @type {import('patchright').LaunchOptions} */
   const launchOpts = {
@@ -417,6 +486,9 @@ async function runDaemon({ scriptPath }) {
     viewport: null,
     acceptDownloads: true,
   };
+  // Opt-in touch-only (tablet-class) configuration: it has no mouse. Off by default:
+  // a desktop that reports maxTouchPoints=0 must never receive touch input (see src/touch.js).
+  if (touchMode) launchOpts.hasTouch = true;
 
   // Strip --no-sandbox from Patchright's default args unless we're in an
   // environment that genuinely needs it (root Linux / Docker, where the
@@ -436,6 +508,12 @@ async function runDaemon({ scriptPath }) {
     const exe = cfg.chromeExecutable();
     if (exe) launchOpts.executablePath = exe;
   }
+
+  // Measure the timer granularity in the background while the browser starts (the event loop is idle then):
+  // timing.preciseSleep needs it to know how long a tail to spin instead of sleeping.
+  timing.measureGranularity()
+    .then((g) => cfg.appendLog(`timer granularity ${g} ms`))
+    .catch((e) => cfg.appendLog(`timer granularity not measured (${e.message}); using the platform default`));
 
   let context;
   try {
@@ -461,6 +539,10 @@ async function runDaemon({ scriptPath }) {
 
   // The initial page becomes the keeper; any extra initial pages are adopted.
   const initial = context.pages();
+  // Pin the event clock BEFORE the keeper is minimized (a visible page surely takes input): one timestamped mouse
+  // event on the daemon's OWN keeper page - never a website's - makes Chrome freeze its clock offset at the instant
+  // ours is anchored (see src/timing.js). A failure is logged, not fatal.
+  if (initial.length) await pinEventClock(initial[0]);
   if (initial.length) await session.setupKeeper(initial[0]);
   for (const p of initial.slice(1)) session.adoptPage(p);
 
@@ -475,6 +557,7 @@ async function runDaemon({ scriptPath }) {
         if (orec) { openerId = orec.id; cwd = orec.cwd; }
       } catch { /* ignore */ }
       session.adoptPage(page, { opener: openerId, cwd });
+      session.applyTouch(page);
     })();
   });
 
@@ -570,6 +653,7 @@ async function runDaemon({ scriptPath }) {
     shuttingDown = true;
     cfg.appendLog(`shutdown code=${code}`);
     try { server.close(); } catch {}
+    try { require('./clipboard').dispose(); } catch {}
     try { await context.close(); } catch (e) { cfg.appendLog(`context close error: ${e.message}`); }
     try { await cfg.deleteLockfile(); } catch {}
     process.exit(code);

@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nw-fidelity</title>
+<style>
+  /* The whole viewport is the pointer pad; a text box and a scroller sit on top of it. Fits the smallest viewport (headless 758x482). */
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; font: 14px system-ui, sans-serif; }
+  #pad      { position: absolute; left: 0; top: 0; right: 0; bottom: 0; background: #f4f6fb; }
+  #txt      { position: absolute; left: 20px; top: 14px; width: 330px; font-size: 18px; z-index: 2; }
+  #scroller { position: absolute; left: 20px; top: 64px; width: 330px; height: 250px; overflow-y: auto; border: 1px solid #888; background: #fff; z-index: 2; }
+  #scroller .inner { height: 9000px; background: linear-gradient(#ffffff, #b8c4d8); }
+  #btn      { position: absolute; left: 400px; top: 70px; width: 120px; height: 40px; z-index: 2; }
+</style>
+<div id="pad"></div>
+<input id="txt" autocomplete="off" aria-label="text box">
+<div id="scroller"><div class="inner">inner</div></div>
+<button id="btn">Button</button>
+<div id="log" hidden></div>
+<script>
+  // This script runs in the page's MAIN world, like a site's own: what it records is what a site could see. Every event is one JSON node
+  // in the DOM (the product's evaluate runs in an isolated world and reads the DOM, not window globals). The lag of an event
+  // (performance.now() at the handler minus its own timeStamp) is taken FIRST, before anything else costs time.
+  window.rec = (...a) => { const i = document.createElement('i'); i.textContent = JSON.stringify(a); document.getElementById('log').appendChild(i); };
+  const opt = { capture: true, passive: true };
+  for (const t of ['pointermove', 'pointerdown', 'pointerup']) {
+    document.addEventListener(t, (e) => {
+      const lag = performance.now() - e.timeStamp;
+      // [clientX, clientY, timeStamp] of every raw sample the browser coalesced into this event
+      const sub = t === 'pointermove' ? e.getCoalescedEvents().map((c) => [c.clientX, c.clientY, c.timeStamp]) : [];
+      rec('pe', t, e.clientX, e.clientY, e.timeStamp, lag, sub, e.pointerType, e.buttons);
+    }, opt);
+  }
+  for (const t of ['keydown', 'keyup']) {
+    document.addEventListener(t, (e) => {
+      const lag = performance.now() - e.timeStamp;
+      rec('k', t, e.key, e.code, e.timeStamp, lag, e.repeat, e.isTrusted);
+    }, opt);
+  }
+  document.addEventListener('wheel', (e) => {
+    const lag = performance.now() - e.timeStamp;
+    rec('w', e.deltaX, e.deltaY, e.timeStamp, lag, e.isTrusted);
+  }, opt);
+</script>

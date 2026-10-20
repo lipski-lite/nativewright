@@ -1,6 +1,6 @@
 {
   "name": "nativewright",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Agent-drivable Patchright browser daemon with a persistent Chrome profile AND a built-in human-behavior layer (realistic mouse paths, keystroke cadence, scroll physics). Gives AI coding agents (Claude Code, Cursor, Codex, Gemini CLI) a real browser they can steer with one-shot CLI calls — without losing login state and without the robotic input signature that anti-bot systems fingerprint.",
   "keywords": [
     "patchright",
@@ -27,6 +27,8 @@
     "anti-bot",
     "behavioral-stealth",
     "human-behavior",
+    "drag-and-drop",
+    "clipboard",
     "humanlike",
     "humanlike-mouse",
     "humanlike-typing",
@@ -71,7 +73,7 @@
     "stop": "node src/browser.js stop",
     "status": "node src/browser.js status",
     "repl": "node src/browser.js repl",
-    "test": "node --test test/smoke.test.js",
+    "test": "node --test test/smoke.test.js test/input.test.js",
     "test:sanity": "node src/human.sanity.js",
     "install-chromium": "patchright install chromium",
     "install-chrome": "patchright install chrome"

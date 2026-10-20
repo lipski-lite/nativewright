@@ -11,7 +11,8 @@ jobs:
   test:
     name: ${{ matrix.os }} / node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    # the input-layer suite (test/input.test.js) starts real daemons and drives real input: ~7 min locally
+    timeout-minutes: 30
 
     strategy:
       fail-fast: false
@@ -49,8 +50,11 @@ jobs:
       - name: Install Chromium (Patchright-managed)
         run: npx patchright install chromium --with-deps
 
-      - name: Run smoke tests
+      - name: Run tests (smoke + input layer)
         run: npm test
+
+      - name: Run browser-less sanity checks
+        run: npm run test:sanity
 
       - name: Upload artifacts on failure
         if: failure()

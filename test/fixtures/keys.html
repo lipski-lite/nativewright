@@ -1,0 +1,49 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nw-keys</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 16px system-ui, sans-serif; }
+  #in   { position: absolute; left: 20px;  top: 20px;  width: 360px; font-size: 18px; }
+  #ta   { position: absolute; left: 20px;  top: 70px;  width: 360px; height: 70px; font-size: 18px; }
+  #ce   { position: absolute; left: 20px;  top: 160px; width: 356px; min-height: 40px; border: 1px solid #888; font-size: 18px; }
+  #pw   { position: absolute; left: 20px;  top: 230px; width: 360px; }
+  #sel  { position: absolute; left: 420px; top: 20px;  width: 220px; font-size: 18px; }
+  #msel { position: absolute; left: 420px; top: 90px;  width: 220px; }
+  #chk  { position: absolute; left: 420px; top: 220px; }
+</style>
+<input id="in" autocomplete="off" aria-label="main input">
+<textarea id="ta"></textarea>
+<div id="ce" contenteditable="true"></div>
+<input id="pw" type="password" autocomplete="off">
+<select id="sel">
+  <option value="a">Apple</option>
+  <option value="b">Banana</option>
+  <option value="c" disabled>Cherry (disabled)</option>
+  <option value="d">Date</option>
+  <optgroup label="G">
+    <option value="e">Elderberry</option>
+    <option value="f">Fig</option>
+  </optgroup>
+</select>
+<select id="msel" multiple size="5">
+  <option value="1">One</option><option value="2">Two</option><option value="3">Three</option>
+  <option value="4">Four</option><option value="5">Five</option>
+</select>
+<input id="chk" type="checkbox">
+<div id="log" hidden></div>
+<script>
+  window.rec = (...a) => { const i = document.createElement('i'); i.textContent = JSON.stringify(a); document.getElementById('log').appendChild(i); };
+  for (const t of ['keydown', 'keyup']) {
+    document.addEventListener(t, (e) => rec('k', t, e.key, e.code, e.keyCode, e.repeat, e.shiftKey, e.ctrlKey, e.altKey, e.metaKey, e.location, Math.round(e.timeStamp * 10) / 10, e.isTrusted), true);
+  }
+  for (const id of ['in', 'ta', 'ce', 'pw']) {
+    const el = document.getElementById(id);
+    el.addEventListener('paste', (e) => rec('paste', id, e.isTrusted, Array.from(e.clipboardData.types), (e.clipboardData.getData('text/plain') || '').length));
+    el.addEventListener('beforeinput', (e) => rec('bi', id, e.inputType, e.isTrusted));
+  }
+  for (const id of ['sel', 'msel']) {
+    const el = document.getElementById(id);
+    for (const t of ['input', 'change']) el.addEventListener(t, (e) => rec(t, id, Array.from(el.selectedOptions).map((o) => o.value), e.isTrusted));
+  }
+  document.getElementById('msel').addEventListener('mousedown', (e) => rec('msel-mousedown', e.ctrlKey, e.metaKey, e.target.tagName));
+</script>

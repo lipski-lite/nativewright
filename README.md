@@ -81,6 +81,7 @@ Profile persistence means the browser session survives `stop`/`start` cycles: ag
 
 - **Multi-agent by design** — any number of agents share one daemon; each `new` page opens in its own window with a stable id, every command names its page (`--page=<id>`), pages have their own queues and state, and artifacts land in the caller's project. No shared "active page" to clobber. See [Multiple agents at once](#multiple-agents-at-once).
 - **Human-behavior layer (enabled by default)** — mouse moves along cubic Bézier paths with Gaussian jitter, mid-path hesitation, and overshoot-and-correct, dispatched as per-frame coalesced pointer samples; keystrokes use log-normal cadence with per-key dwell, explicit Shift handling and optional typo-simulation; scrolls via real `page.mouse.wheel` ticks with edge-detection. Opt out per-call with `--raw=true`. See [Human-behavior layer](#human-behavior-layer) below.
+- **Low-level input layer** — click, hover and drag by *coordinates* (css or screenshot space, with the DPR trap handled), HTML5 drag-and-drop and pointer drags, held buttons and keys that persist across commands, key presses with hold/auto-repeat, a quantised mouse wheel that acts on the real scroll container (and can be calibrated to your own device), a real clipboard `paste`, native `<select>`, Russian/English keyboard-layout fidelity, file drops, and opt-in gated touch. See [Coordinates, drag and keys](#coordinates-drag-and-keys).
 - **Persistent profile** — cookies, localStorage, IndexedDB, and device tokens survive `stop`/`start`. Log into Google once; Gemini / Gmail / Docs stay live for ~2 weeks per Google's token lifetime.
 - **Real Chrome by default** — `channel: 'chrome'` for maximum stealth; drops to bundled Chromium for CI (`NATIVEWRIGHT_CHANNEL=chromium`).
 - **Stealth preserved** — built on Patchright; no custom UA, no headless by default, no leftover automation flags. Eliminates the detection signals vanilla Playwright emits out of the box, so your own automation of your own accounts looks like normal usage.
@@ -98,7 +99,7 @@ Profile persistence means the browser session survives `stop`/`start` cycles: ag
 
 Modern anti-bot systems don't just fingerprint the browser — they fingerprint the **input stream**. Patchright handles the browser side (WebGL, webdriver flag, Runtime.enable, etc.); NativeWright handles the input side. Every mouse move, click, keystroke, and scroll tick emitted by the daemon passes through a layer that imitates how real humans use a computer.
 
-Enabled **by default** on every interaction command. Zero extra dependencies — everything runs on Patchright's existing `page.mouse.move / down / up / wheel` and `page.keyboard.press` primitives.
+Enabled **by default** on every interaction command. Zero extra dependencies — everything runs on Patchright's existing `page.mouse.*` / `page.keyboard.*` primitives and the CDP `Input.*` domain over the session Patchright already holds.
 
 Opt out per-call with `--raw=true` when you need robotic precision (invisible elements, programmatic fills, scripted logins where slow typing would itself look suspicious).
 
@@ -112,13 +113,17 @@ Opt out per-call with `--raw=true` when you need robotic precision (invisible el
 | **Fitts-law timing** | Move duration grows log-linearly with distance and shrinks with target size (`mean = 80 + 90·log2(d/w + 1)` ms), sampled as log-normal. |
 | **Landing distribution** | Never dead-centre. Gaussian around the centre with aspect-aware σ — wide elements have wider X spread (matches where the visible label text is). |
 | **Click dwell** | mousedown→mouseup holds 30-180 ms (log-normal, median 70). Settle pause before the button press. |
+| **Real-time scheduling** | Dwells, key gaps, wheel gaps and path frames are dispatched at their instant by a precise scheduler (a timer for the bulk, a cooperative spin for the last tick), not by Node's `setTimeout`, which lands on the OS timer tick — 15.6 ms on Windows: measured, 86% of click dwells sat within ±1 ms of that lattice and a key-up stamped "down + dwell" reached the page up to 16 ms late. Discrete events (click, key, wheel, touch) carry no timestamp of ours — Chrome stamps them when they arrive, like real input; only the coalesced pointer sub-samples are timestamped explicitly, from a monotonic clock pinned to the browser's own at daemon start (a wall-clock stamp would drift from Chrome's once the system clock is slewed or stepped). |
+| **Device-pixel grid** | Every pointer coordinate is snapped to the device-pixel grid (`round(v·dpr)/dpr`: integers at dpr 1), as a real mouse reports physical pixels — the burst sub-samples, paths, overshoot, drags, the wheel position, `drop-files` points and the `--raw` coordinate commands. Touch is exempt (sub-pixel digitizer positions). |
 | **Keystroke cadence** | Per-character base mean (letters fast, digits/punctuation slower, uppercase slower due to Shift hold), log-normal jitter, burstiness, post-space and post-punctuation extra pauses, occasional 200-2200 ms mid-sentence pauses. |
 | **Per-key dwell** | Individual key down-up hold times sampled independently; keys don't fire in uniform 50 ms pulses. |
 | **Typo simulation** | ~0.8% per char chance of pressing the wrong QWERTY neighbour, noticing, pressing Backspace, correcting. **Auto-disabled** for password / OTP / CVV / secret / token fields (detected by `type=password`, name/id/autocomplete attrs). |
-| **Scroll physics** | Real `page.mouse.wheel` ticks with variable magnitude (60-180 px) and log-normal inter-tick gaps. Occasional "reading" pauses. **Edge-detection**: stops when `window.scrollY` doesn't advance for 2 consecutive ticks. |
+| **Scroll physics** | A quantised mouse wheel: whole notches (`deltaY` in multiples of 100, `deltaMode` 0), mostly one per event with the occasional 2–3 in a fast flick, 15–40 ms inside a flick, log-normal "reading" pauses between flicks — or *your* wheel's own statistics after `calibrate-wheel`. **Edge-detection** tracks the scroll offset of the real scroll container under the pointer (an SPA's inner panel, a horizontal scroller, or the document), not `window.scrollY`. |
 | **Scroll-to-element** | Wheels naturally toward off-screen elements before interacting (not `scrollIntoViewIfNeeded`, which teleports). |
 | **Think-time** | Between actions: three-regime log-normal (15% skip, 60% short 80-900 ms, 20% medium 300-1800 ms, 5% long 700-4500 ms). Prevents detectors from fitting a single distribution to action spacing. |
-| **Field clearing** | Triple-click + Ctrl+A + Delete (matches what users actually do) — handles React-controlled inputs and contenteditables that resist programmatic `fill`. |
+| **Held inputs** | Mouse buttons and keys can be held across commands (`mouse-down`, `key-down`, `--hold`); every pointer sample carries the held `buttons`, `button` and `modifiers` exactly as Playwright's own mouse would. |
+| **Keyboard layouts** | Characters are typed on the physical key of the active layout (US or Russian ЙЦУКЕН); a human Alt+Shift layout switch precedes a character from the other layout; typos hit physically adjacent keys; emoji and other scripts are committed like an IME. |
+| **Field clearing** | Triple-click + select-all (Ctrl+A, Cmd+A on macOS) + Delete (matches what users actually do), the keys pressed through the same key emitter as `press` (physical key, human dwell) — handles React-controlled inputs and contenteditables that resist programmatic `fill`. |
 | **Seeded randomness** | Pass `--seed=<integer>` for reproducible runs. Omit for non-deterministic. |
 
 ### Examples
@@ -221,7 +226,7 @@ nativewright repl
 
 NativeWright is designed to be driven by agents. The pattern is identical across Claude Code, Cursor, Codex, and Gemini CLI:
 
-1. **Locate the binary** — call the `nativewright` bin directly if it's on PATH; otherwise `install.json` under the data root (`~/.local/share/nativewright/` on Linux, `~/Library/Application Support/NativeWright/` on macOS, `%LOCALAPPDATA%\NativeWright\` on Windows) has a `scriptPath` that resolves to `browser.js`.
+1. **Locate the binary** — call the `nativewright` bin directly if it's on PATH; otherwise `install.json` under the data root (`~/.local/share/nativewright/` on Linux, `~/Library/Application Support/NativeWright/` on macOS, `%LOCALAPPDATA%\NativeWright\` on Windows) has a `scriptPath` that resolves to `browser.js`. That pointer belongs to the *installed* package: a daemon started from an npm install writes or refreshes it, while a start from a git checkout (or `npm link`) never replaces a valid pointer to another path — it only creates one when none exists or the old one points at a script that is gone (the daemon log says when it declined).
 2. **Check status** — `nativewright status` → `{running, pid, port, pageCount, pages}`.
 3. **Start if needed** — run `nativewright start` in a background-capable shell (`&`, `nohup`, or the agent's `run_in_background` facility), then `wait-ready`.
 4. **Claim a page** — `nativewright new --label=<task>` opens a page in its own window and returns a stable id (`p1`, `p2`, …). Remember it.
@@ -279,10 +284,25 @@ All page commands accept `--page=<id>` (required whenever more than one page is 
 |  | `rightclick <selector>` | selector | right-button click (context menu) |
 |  | `fill <selector> <value>` | selector, value | human: select-all + clear (gesture varies) + typed cadence with explicit Shift handling |
 |  | `type <selector> <text>` | selector, text | human keystroke cadence; `--typos=on\|off\|auto` (auto disables for password fields) |
-|  | `press <key>` | key | e.g. `Enter`, `Control+A`, `ArrowDown`; human-mode adds pre-press hesitation |
-|  | `hover <selector>` | selector | human mouse path to element |
-|  | `select <selector> <value>` | selector, value | `<select>` option |
-|  | `scroll <top\|bottom\|up\|down\|<px>>` | direction | human: real wheel ticks with edge-detection |
+|  | `press <key>` | key | `Enter`, `a`, `Control+A`, `Control+Shift+ArrowLeft`; human CDP key emitter; `--hold=<ms>` (auto-repeat), `--repeat=<n>` |
+|  | `hover <selector>` | selector | human mouse path to element; `--at=x,y` |
+|  | `click-at <x> <y>` | x, y | click a viewport point; `--space`, `--button`, `--clickCount`, `--hold=<ms>`, `--modifiers=`, `--exact` |
+|  | `hover-at <x> <y>` | x, y | move the pointer to a viewport point |
+|  | `element-at <x> <y>` | x, y | read-only hit test (tag, id, text, box, cursor, draggable, editable, selectorHint, iframe chain) |
+|  | `drag <from> <to>` | from, to | element to element; `--from-at`, `--to-at`, `--button`, `--modifiers`; HTML5 vs pointer routed automatically |
+|  | `drag-at <x1> <y1> <x2> <y2>` | 4 numbers | viewport point to viewport point |
+|  | `mouse-down` / `mouse-up` | — | press / release at the pointer (`--button`); the hold persists across commands |
+|  | `key-down <key>` / `key-up <key>` | key | hold / release a key; persists across commands |
+|  | `release` | — | release every button and key the page holds (reverse order) |
+|  | `type-focused <text>` | text | human typing into the focused element (no click); `--typos=on\|off\|auto` |
+|  | `paste <selector> <text>` | selector, text | REAL clipboard paste (human Ctrl+V), `--from-file=<path>`; OS clipboard restored |
+|  | `paste-focused <text>` | text | the same, into the focused element |
+|  | `drop-files <selector> <path>…` | selector, paths | drop OS files onto an element; `--at=x,y` |
+|  | `tap <selector>` / `tap-at <x> <y>` | — | touch tap (refused unless `NATIVEWRIGHT_TOUCH=1`; on that touch-only profile every mouse command is refused instead, see [Touch](#touch-opt-in-gated)) |
+|  | `swipe <x1> <y1> <x2> <y2>` / `pinch <x> <y> --scale=<f>` | — | touch gestures (same gate) |
+|  | `calibrate-wheel` | — | record the human's own wheel (`--seconds=10`) on a blank or local page (`new` starts on `about:blank`); only a human calibration is adopted |
+|  | `select <selector> <value>` | selector, value | native `<select>`: real click, arrow keys, Enter (multiple: click / Ctrl-click); matches value or label; `--raw` = `selectOption` |
+|  | `scroll <up\|down\|left\|right\|top\|bottom\|<px>>` | direction | quantised wheel on the scroll container under the pointer; `--dx=<px>`, `--target=<selector>`, `--x=<n> --y=<n>` |
 |  | `upload <selector> <path>` | selector, path | file input |
 | Wait | `wait <ms>` | ms | blind sleep |
 |  | `wait-for <selector>` | selector | `--state=visible\|hidden\|attached\|detached` |
@@ -297,13 +317,133 @@ All page commands accept `--page=<id>` (required whenever more than one page is 
 |  | `cookies [--url=...]` | — | domain-scoped cookie dump (pageless) |
 | Frames | `frame <name>` / `frame --reset` | name | scope this page's interactions to a frame |
 | Dialogs | `dialog <accept\|dismiss> [prompt]` | action, promptText? | this page's policy for alert/confirm/prompt |
-| Artifacts | `shot [name]` | name? | PNG under the caller's `./artifacts/` |
+| Artifacts | `shot [name]` | name? | PNG under the caller's `./artifacts/`; `--scale=device\|css`, `--selector=<sel>`, `--fullPage`; returns `dpr`, `viewport`, `scroll`, `imageSize`, `clip` |
 |  | `save-artifact [name]` | name? | PNG + HTML + metadata JSON bundle |
 |  | `downloads [--n=N]` | — | this page's captured downloads with auto-saved paths |
 | Diagnostics | `console [--n=N]` | — | this page's recent `console.*` messages (re-injected hook) |
 |  | `network-log [--n=N]` | — | this page's recent requests/responses |
 |  | `state` | — | pages, idle timer, command ring buffer (pageless) |
 | Viewport | `viewport <w> <h> --force` | w, h | overrides the real window geometry; requires `--force` |
+
+## Coordinates, drag and keys
+
+The selector commands (`click`, `fill`, `hover`, …) are the default: a selector survives layout changes and the command scrolls the element into view for you. Reach for **coordinates** when there is no usable selector — a `<canvas>`, a game, a map, a drawing surface, a widget in a cross-origin iframe, something you only know from a screenshot.
+
+| You have… | Use |
+|---|---|
+| a stable selector | `click`, `drag`, `hover`, … (add `--at=x,y` to aim *inside* the element) |
+| a point on the screen | `click-at`, `hover-at`, `drag-at`; `element-at` first if you want to know what is there |
+| only a screenshot | `shot`, read the point off the image, then `click-at … --space=screenshot` |
+
+All coordinate commands work at **page level** (they ignore the `frame` scope): raw input at page coordinates is routed by Chrome into iframes, cross-origin ones included.
+
+### Coordinate spaces and the DPR trap
+
+`--space=css` (default) is CSS pixels relative to the viewport — the numbers `clientX`/`clientY` report. `--space=screenshot` is device pixels measured on a `shot` image taken with the default `--scale=device`; the daemon converts with `css = px / devicePixelRatio`. For offsets inside an element (`--at`), measure on an element screenshot (`shot --selector=…`).
+
+On a display scaled to 150% `devicePixelRatio` is 1.5 and the screenshot is 1.5× larger than the page is in CSS pixels. Worked example, from this repo's own test machine (viewport 1166×726 CSS px, dpr 1.5):
+
+```bash
+nativewright shot home --page=p1
+# → { "dpr": 1.5, "viewport": { "width": 1166, "height": 726 }, "imageSize": { "width": 1749, "height": 1089 }, … }
+# you read the Button's centre off the image: (1177.5, 243) device pixels
+nativewright click-at 1177.5 243 --page=p1
+# → ok:false  point (x=1177.5, y=243) [space=css] is outside the viewport: viewport 1166x726 CSS px, dpr 1.5;
+#             converted to css (1177.5, 243); … (hint: did you mean --space=screenshot?)
+nativewright click-at 1177.5 243 --space=screenshot --page=p1
+# → css (785, 162): the Button
+```
+
+A point that happens to fit inside the viewport is *not* rejected — it just lands 50% too far right/down — so always say which space you measured in. `shot` returns everything needed to convert: `dpr`, `viewport`, `scroll`, `scale`, `imageSize` (read from the PNG header) and `clip` (the CSS rectangle the image covers; the element's box with `--selector`). `--scale=css` gives one image pixel per CSS pixel and makes the two spaces equal. Every validation error states the viewport size, the dpr and the converted css values.
+
+### What is there? `element-at`
+
+```bash
+nativewright element-at 520 160 --page=p1
+# → { css, dpr, viewport, hit: { tag, id, classes, role, name, text, href, box, cursor, draggable, editable, selectorHint }, frames: [ { url, box } ] }
+```
+
+Read-only (no input is dispatched). `draggable` is *effective* (an ancestor's, `img` and `a[href]` are draggable by default); `selectorHint` is a short selector that matches exactly that element; when the point is inside an iframe — same- or cross-origin — `hit` is the innermost element (its `box` in page viewport px) and `frames` is the chain that was drilled through. `click-at`/`hover-at` run the same hit test first (the Fitts target width comes from the element found) and return it as `hit`. `click-at` lands on your point plus a hand's tiny jitter (σ≈0.6 px, ≤ 2 px); `--exact=true` skips only that jitter. The landing point is snapped to the **device-pixel grid** — integers at `devicePixelRatio` 1, multiples of 1/dpr otherwise, which is what a real mouse reports (it reports physical pixels) — and that snapped point is what `landedAt` reports and what the page sees in `PointerEvent.clientX/Y`, in every coalesced sub-sample as well. (Measured before: Playwright passes a float straight through — a mouse press at (120.43, 60.29) arrived as `clientX` 120.43000030517578, and 16 of 569 pointer coordinates of a click grid were fractional.) The same grid applies to every pointer coordinate the daemon dispatches — paths, overshoot, drags, the wheel's position, `drop-files` points and the `--raw` coordinate commands; touch coordinates are not snapped (a digitizer reports sub-pixel positions), and the selector commands that Playwright positions itself under `--raw` (`click <selector> --raw` and friends) stay robotic.
+
+### Drag: two different mechanisms
+
+`drag <from> <to>` and `drag-at <x1> <y1> <x2> <y2>` look at the start point and choose:
+
+| Start point | `mode` | How the moves are sent |
+|---|---|---|
+| an HTML5-draggable element (effective `draggable`) | `html5` | through Playwright's mouse, one awaited move per path point — patchright's drag manager only intercepts drags that *its* mouse causes; you get real `dragstart`/`dragenter`/`dragover`/`drop`/`dragend` with the `dataTransfer` payload |
+| anything else: sliders, canvases, resize handles, custom pointer-event drags | `pointer` | the usual coalesced raw-CDP pointer bursts with the button held (`buttons: 1`, `pressure: 0.5`, `getCoalescedEvents().length > 1`) |
+
+This is required, not cosmetic: on Chrome 149 raw CDP moves over a draggable start a native drag (`dragstart` fires) but never deliver `dragenter`, `dragover`, `drop` or `dragend`. The human drag is: move to the start → settle → modifiers down → press → ~150 ms pre-drag hold → move to the end *with the button held* (Fitts × 1.4, a little wobble, never an overshoot) → 80–200 ms settle → release → modifiers up. Options: `--from-at`/`--to-at` (offsets inside the elements), `--button`, `--modifiers`, `--raw` (Playwright `dragTo` / stepped moves). A source and target that are not both visible are an error rather than a guess.
+
+### Holds and `release`
+
+```bash
+nativewright key-down Shift --page=p1          # stays down across commands
+nativewright click-at 300 200 --page=p1        # → mousedown.shiftKey === true
+nativewright mouse-down --page=p1              # a button, at the current pointer
+nativewright hover-at 500 200 --page=p1        # drag by hand: the moves carry buttons=1
+nativewright mouse-up --page=p1
+nativewright pages                              # input: { pointer: {x,y}, held: { buttons: [...], keys: [...] }, layout }
+nativewright release --page=p1                 # lets go of everything, in reverse order of pressing
+```
+
+State is per page and visible in `pages`/`state`, so a forgotten hold is easy to spot. Commands that press something themselves (`click-at --modifiers`, `drag`, `press`) release exactly what *they* pressed, even on error or timeout; explicit `key-down`/`mouse-down` holds persist by design. A button that is already held cannot be pressed again. Closing a page releases what it still holds. `--modifiers` takes `Control,Shift,Alt,Meta` (case-insensitive; `Ctrl`, `Cmd`, `Win`, `Option` aliases). Modifier keys go through Playwright's keyboard so they are stamped onto its mouse events too.
+
+### Keys
+
+`press` is human by default: `press Control+Shift+ArrowLeft` presses the modifiers first (a 40–120 ms lead each), the main key with a human dwell, and releases in reverse with lag; the page sees `ControlLeft↓ ShiftLeft↓ ArrowLeft↓ ArrowLeft↑ ShiftLeft↑ ControlLeft↑`. Dwells and gaps are dispatched in real time by a precise scheduler (no 15.6 ms timer tick), and these discrete events carry no timestamp of ours: Chrome stamps them when they arrive, like real input. `--hold=<ms>` keeps the main key down — past ~500 ms (±60, sampled per press) it **auto-repeats** with `autoRepeat: true` keydowns every ~33 ms (OS auto-repeat is timer-regular), and a held *printable* key keeps typing, exactly like hardware: `press a --hold=1200` in an input types `aaaaaaaaaaaaaaaaaaaaaa`. `--repeat=<n>` presses n times with human gaps. `key-down`/`key-up` accept the named keys (Shift, Control, Alt, Meta, Enter, Tab, Escape, Backspace, Delete, Insert, Home, End, PageUp, PageDown, ArrowUp/Down/Left/Right, Space, F1–F12), single printable characters and physical codes such as `KeyA`; anything else is an error. `type-focused <text>` types into whatever has focus (no click) — if nothing editable is focused the key events still go out, which is what a canvas game listening on `window` needs. `type`, `fill`, `type-focused` and the paste fallback all honour `--typos=on|off|auto`.
+
+### Scrolling
+
+```bash
+nativewright scroll down --target=".chat-panel" --page=p1   # move the pointer into the panel, then wheel
+nativewright scroll right --target="#timeline"              # horizontal scrollers
+nativewright scroll 3000 --x=600 --y=400                    # wheel at a viewport point
+nativewright scroll --dx=400                                # an explicit horizontal amount
+nativewright scroll bottom                                  # to the container's edge
+```
+
+The wheel acts on the **scroll container under the pointer** — the nearest ancestor that scrolls on that axis (a single-page app's inner panel, a horizontal scroller), else the document — and edge detection tracks *that* container's scroll offset. (The old code watched `window.scrollY`, which never moves when an inner panel scrolls: asked for 3000 px it scrolled 452 px and stopped.) The response reports the container and what really happened: `{ scrolledBy, axis, container: { tag, id, isDocument }, before: {x,y}, after: {x,y}, events, … }`.
+
+A physical wheel is quantised: the default model sends whole notches (`deltaY`/`deltaX` in multiples of 100, `deltaMode` 0 — mostly one notch per event, occasionally 2–3 in a fast flick, 15–40 ms apart, with reading pauses between flicks), so a request is approximate (`scroll 30` is one notch = 100 px) and `scrolledBy` is the distance actually moved. A box that only has a wheel handler (nothing natively scrollable, e.g. a custom virtual list) still receives the events and is reported `scrollable: false`. **`calibrate-wheel`** replaces the default with *your* device: open a blank page (`nativewright new --label=calibrate` starts on `about:blank`) and run `nativewright calibrate-wheel --seconds=10 --page=<id>` there, scroll with your own mouse wheel behind the on-page overlay, and the delta quantum, flick lengths and gap statistics are stored machine-wide in `<data root>/wheel-calibration.json` (fewer than 20 events is rejected); the scroll engine then samples from your profile. The overlay is a DOM element and the recorder a page listener, both visible to a site's own scripts, so **calibrate-wheel refuses any page that is not `about:blank`, a `data:` or `file:` URL, or `http(s)` on `localhost` / `127.0.0.1` / `[::1]`** — the error says so and names the blank-page way out. **Only a human calibration is adopted**: `--simulate=true` (a self-test that feeds the recorder through CDP) writes a profile marked `source: simulated`, which is saved but never used for scrolling — learning from our own synthetic events would be circular. `calibrate-wheel`, `scroll`, `state` and `status` report the model in force (`wheelModel: 'default' | 'human'`; `state` also shows `wheelCalibration` with `adopted`).
+
+### Clipboard paste
+
+`paste <selector> <text>` (click/focus the field like a person, then paste) and `paste-focused <text>` perform a **real paste**: the text is placed on the OS clipboard, a human Ctrl+V follows (Control through Playwright's keyboard, `V` through the CDP key emitter; Cmd on macOS), and the page receives a trusted `paste` event with `clipboardData` and a `beforeinput` of `inputType: 'insertFromPaste'` — what sites that special-case pasted text expect. `--from-file=<path>` (relative to your cwd) pastes a long file.
+
+The clipboard belongs to the human user and is shared by every daemon, so: a **machine-wide, per-OS-user lock** (`<os.tmpdir()>/nativewright-clipboard.lock` — `nativewright-clipboard-<uid>.lock` on Linux/BSD, where `/tmp` is shared; created exclusively, holding `{pid, page, id, at, hb}`; the holder refreshes `hb` every second, so the lock is kept for as long as its holder is alive and is reaped when its pid is dead or there has been no heartbeat for 15 s; waits up to 10 s) serialises pastes across **every** daemon — it is deliberately *not* under `NATIVEWRIGHT_HOME`, because the clipboard belongs to the OS session, not to a data root, so daemons with different roots (named profiles under another root, test daemons) still queue instead of overwriting each other's payload; **only an empty or plain-text-only clipboard is ever touched** — an image, a file list, HTML/RTF or any other format is left exactly as it is and the text is typed instead; the previous text is restored afterwards, and only while the clipboard still holds our payload (if you copied something else meanwhile, yours stays). Clipboard contents are never logged or returned. Windows uses a long-lived `powershell -STA` helper (started before the lock is taken; it keeps dispatching window messages while idle, because an owner that does not makes other applications' clipboard writes wait about 5 s; every call inside the lock times out after 10 s, and a helper that still owes an answer is killed before the lock is released), macOS `pbpaste`/`pbcopy`, Linux `wl-clipboard` or `xclip` (`xsel` as a last resort).
+
+The response is `{ method, chars, verified, clipboardRestored, clipboardTouched, lockWaitMs, reason?, detail? }`. `method: 'typed'` with a `reason` code (`headless`, `no-clipboard-tool`, `non-text clipboard`, `clipboard-busy`, `clipboard-unreadable`, `clipboard-unwritable`, `paste-no-effect`; `detail` has the specifics, e.g. the format names found) means the safe fallback was used: headless Chrome (its clipboard lives inside the browser process, not the OS), no clipboard tool, a non-text clipboard, a lock that stayed busy for 10 s, a clipboard that could not be read or a helper that could not be started (`clipboard-unreadable`), a clipboard another application holds open (clipboard managers do), or a Ctrl+V that changed nothing. If the clipboard is stuck mid-paste the helper is stopped and the restore is tried once through a fresh one; unless the original is confirmed back, `clipboardRestored` is `false` with a `restoreNote`. The typed fallback is for short texts: it types at a human's pace (~190 ms a character) while the page's command queue is blocked, so a text longer than **2000 characters** (headless, or a busy clipboard, with `--from-file` up to 5 MB) is refused instead of typed for hours — the error names the fallback reason, says how many minutes typing it would take, and suggests a headed daemon with an empty or plain-text clipboard (a real paste), or `fill --raw=true` for bulk text.
+
+Two caveats. On Windows the payload is flagged so that clipboard history (Win+V), cloud clipboard sync and clipboard monitors that honour the Windows exclusion formats skip it (your own text is restored as plain text, without the flags), but any application can read the clipboard while the payload is on it and a tool that ignores the flags may record it — **never use `paste` for a secret**; `fill`/`type` never touch the clipboard. And the first paste in a daemon pays the clipboard helper's start-up (1–10 s for PowerShell on a slow machine; `paste <selector>` hides most of it behind the human click).
+
+### Keyboard layouts
+
+Typing is done on physical keys, so a layout is a map from characters to `{code, keyCode, shift}`. Latin text uses the US layout; Cyrillic uses Russian ЙЦУКЕН (`й` is `KeyQ`/81, `ф` is `KeyA`/65, `ж` is `Semicolon`/186, … — `key` is the character, `code` and `keyCode` those of the key position; capitals are Shift + the same key). The active layout is tracked per page (`pages` → `input.layout`, starting at `en`). When the next character is only typable on the other layout the engine first performs what a person does: a layout-switch chord (Alt down, Shift down, Shift up, Alt up — the page sees those modifier events exactly as on hardware; `NATIVEWRIGHT_LAYOUT_SWITCH=ctrl+shift` changes it), then continues. A character typable on both (`.` is Period on EN and Slash on RU) uses the active layout's key and needs no switch. Characters on neither layout — emoji, CJK, other scripts — are committed with `Input.insertText` (what an IME or emoji picker does): never a keydown with an empty `code`/`keyCode 0`. Typo simulation picks a physically adjacent key, so a Russian typo is the Russian letter beside the intended one. Shortcuts such as `Control+A` are pressed by key position and never switch layouts. Note the OS layout itself is not changed; only the events differ.
+
+### Native `<select>`
+
+`select <selector> <value>` opens the list with a real click, walks to the option with ArrowDown/ArrowUp at human cadence (disabled options are skipped when counting), presses Enter, and verifies the value (`method: 'keyboard'`); if verification fails it falls back to `selectOption` (`method: 'fallback'`). `<select multiple>`: a plain click on the first option, Ctrl-click (Cmd on macOS) on each further one. `<value>` matches an option's value or label; for `multiple` pass a JSON array (`'["2","4"]'`). `--raw=true` is plain `selectOption`.
+
+### Touch (opt-in, gated)
+
+`tap <selector>`, `tap-at <x> <y>`, `swipe <x1> <y1> <x2> <y2>` and `pinch <x> <y> --scale=<factor>` dispatch real touch events with human finger paths (touchStart → frame-paced touchMove → touchEnd; varying contact radius and pressure; a pinch is two staggered contacts). They are **refused** unless the page reports touch capability, because a "desktop" that reports `navigator.maxTouchPoints === 0` yet delivers `touchstart` is a physically impossible, detectable contradiction — and Chrome *does* deliver touch events dispatched over CDP in that state (verified). To use them start a separate touch-capable daemon: `NATIVEWRIGHT_TOUCH=1 nativewright start --profile=touch`.
+
+**The mirror image: a touch daemon refuses the mouse.** Touch support also turns the page into a touch-*only*, tablet-class device (table below), and such a device cannot produce `pointerType: 'mouse'` events or a wheel. So on a page that reports `(any-pointer: fine)` false, every mouse-dispatching command is **refused** with an error that names the alternatives — `click`, `dblclick`, `rightclick`, `hover`, `click-at`, `hover-at`, `drag`, `drag-at`, `mouse-down`, `mouse-up`, `scroll` (wheel), `calibrate-wheel --simulate`, and the selector text commands that focus their field with a click (`fill`, `type`, `select`, `paste <selector>`) — and **`--raw` does not lift it**. The workflow on this profile: `tap` the field, then `type-focused` / `paste-focused` / `press` / `key-down` / `key-up` / `release`; `swipe` to scroll, `pinch` to zoom; `drop-files`, `element-at` and `shot` work as usual (an off-screen `tap` or `drop-files` target is scrolled into view with finger drags, never a wheel; `drop-files`, an OS file drag, does not move a mouse pointer that does not exist). Hover-only UI is out of reach there by design. A normal daemon is the other half of the same rule: it refuses touch.
+
+What `NATIVEWRIGHT_TOUCH=1` does to the fingerprint (measured on Chrome 149, headed and headless alike): `hasTouch` makes `navigator.maxTouchPoints` 1 (the daemon raises it to 10 on every page, consistently inside cross-origin iframes), `'ontouchstart' in window` true — and also flips the media profile to a *touch-only* device: `(pointer: coarse)` and `(any-pointer: coarse)` match, `(any-pointer: fine)`, `(pointer: fine)` and `(any-hover: hover)` do **not**, `(hover: none)` matches. That is the profile of a tablet with no mouse, not of a touchscreen laptop (which would also match `any-pointer: fine` and `any-hover: hover`), and Chrome offers no flag or CDP override for those media features (`Emulation.setEmulatedMedia` ignores them; `--touch-events=enabled` alone gives `ontouchstart` with `maxTouchPoints: 0`, worse). The measured profile, which the mouse refusal is keyed on (`matchMedia` values, identical headed at dpr 1.5 and headless):
+
+| page profile | `maxTouchPoints` | `ontouchstart` | `pointer` fine / coarse | `any-pointer` fine / coarse | `hover` hover / none | `any-hover` hover / none |
+|---|---|---|---|---|---|---|
+| default daemon | 0 | false | **true** / false | **true** / false | true / false | true / false |
+| `NATIVEWRIGHT_TOUCH=1` | 10 | true | false / **true** | **false** / true | false / true | false / true |
+
+Use the touch daemon only for sites that need touch input, never for the logged-in default profile. A pinch's `--scale` is the ratio of the two finger distances; Chrome amplifies it (a 2× ratio zoomed the visual viewport to 4×).
+
+### File drops
+
+`drop-files <selector> <path> [<path>…]` drops files from disk onto a drop zone the way a person drags them from the file manager: the drag **enters from the window edge nearest the target**, `dragover` events follow a human path to a point inside the element (or `--at=x,y`), it settles briefly, and drops. Implemented with `Input.dispatchDragEvent` carrying the real paths, so the page gets trusted `dragenter`/`dragover`/`drop` events whose `DataTransfer.files` hold real `File` objects (name, size, type, content). The drag offers what a file manager's does — copy, link and move (`dataTransfer.effectAllowed` is `'all'`) — so a page that answers with `dropEffect = 'move'` still gets its drop (measured: offering `copy` only gave `effectAllowed` `'copy'`, and then such a page got no drop at all). Dropping on an `<input type=file>` fills it and fires `change`. Paths resolve against your working directory and must exist and be files. The page receives the file contents, so drop files only onto sites you trust.
 
 ## Environment variables
 
@@ -319,6 +459,8 @@ All page commands accept `--page=<id>` (required whenever more than one page is 
 | `NATIVEWRIGHT_CHANNEL` | Patchright channel | `chrome` |
 | `NATIVEWRIGHT_HEADLESS` | headless mode (**CI only — breaks stealth**) | `false` |
 | `NATIVEWRIGHT_NO_EXEC_PATH` | skip local Chrome probe (let Patchright resolve) | `false` |
+| `NATIVEWRIGHT_TOUCH` | launch a touch-capable browser (enables `tap` / `swipe` / `pinch`; the profile becomes touch-only, so mouse commands are refused; see [Touch](#touch-opt-in-gated)) | `false` |
+| `NATIVEWRIGHT_LAYOUT_SWITCH` | shortcut used for the EN↔RU layout switch: `alt+shift` or `ctrl+shift` | `alt+shift` |
 | `NATIVEWRIGHT_ALLOW_NO_SANDBOX` | keep `--no-sandbox` in Chrome args (needed on root Linux / Docker) | `false` on Windows/macOS/non-root Linux; auto-true on root Linux |
 
 **Per-user data root defaults:**
@@ -366,9 +508,20 @@ src/
 ├── commands.js       command handlers (goto / click / shot / …)
 ├── cli.js            HTTP client for one-shot + REPL modes
 ├── config.js         env, paths, lockfile I/O, Chrome detection
-├── human.js          human-behavior primitives (Bézier paths, Fitts timing,
-│                     log-normal keystroke cadence, wheel physics)
-└── human.sanity.js   browser-less sanity tests for the math in human.js
+├── human.js          human-behavior primitives (Bézier paths, Fitts timing, per-page input state,
+│                     key emitter, layout-aware typing, container-aware wheel scrolling)
+├── timing.js         precise sleep (a timer + a cooperative spin: off the OS timer tick) and the monotonic event clock pinned to Chrome's
+├── keys.js           named keys, modifier names/aliases, combo parsing
+├── layouts.js        US + Russian layouts keyed on physical codes, typo neighbours
+├── wheel.js          quantised wheel model + calibration profile (machine-wide)
+├── coords.js         coordinate spaces (css / screenshot) and validation
+├── inspect.js        hit testing, iframe/shadow drill-in, scroll-container discovery
+├── clipboard.js      OS clipboard backends + the machine-wide (per OS user, os.tmpdir()) clipboard lock
+├── paste.js          the real-paste flow (start helper → lock → snapshot → Ctrl+V → verify → restore → unlock)
+├── touch.js          gated touch gestures (+ finger-drag scrolling for touch-only pages)
+├── modality.js       input modality must match the fingerprint: mouse commands refused on touch-only pages
+├── filedrop.js       OS file drag-and-drop
+└── human.sanity.js   browser-less sanity tests for the maths and the typing engine
 ```
 
 The daemon is **single-process, single-context**. Spawn multiple daemons only if you also use distinct `NATIVEWRIGHT_HOME` roots to avoid lockfile collisions.
@@ -381,11 +534,13 @@ cd nativewright
 npm install
 npx patchright install chromium     # or: install chrome
 
-# Run the integration smoke test
-npm test
+# Integration tests: the smoke test + the input-layer suite (real daemon, real Chrome)
+npm test                                  # headed
+NATIVEWRIGHT_HEADLESS=1 npm test          # headless (CI)
+npm run test:sanity                       # browser-less maths / typing-engine checks
 ```
 
-Tests use Node's built-in `node:test` runner (no external framework). CI runs the same test on Windows, macOS, and Ubuntu via GitHub Actions.
+Tests use Node's built-in `node:test` runner (no external framework). CI runs the same test on Windows, macOS, and Ubuntu via GitHub Actions. The input-layer suite (`test/input.test.js`) starts its own daemons with fresh temporary `NATIVEWRIGHT_HOME` / `NATIVEWRIGHT_USER_DATA_DIR` / `NATIVEWRIGHT_ARTIFACTS_DIR` (it never touches a real profile or a running daemon) and takes several minutes; run it headed once in a while and leave the mouse alone while it does, because a physical mouse move competes with the injected one. One test is headed-only (two daemons with different `NATIVEWRIGHT_HOME` pasting at once through the one OS clipboard), and the paste tests adapt to the clipboard they find: they never touch one that holds anything but plain text or nothing.
 
 ## Acknowledgements
 

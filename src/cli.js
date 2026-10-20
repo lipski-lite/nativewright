@@ -50,7 +50,37 @@ const POSITIONAL = {
   close:        [],
   'close-page': [],
   pages:        [],
+  // coordinates, drag, keys, holds (v2.2)
+  'click-at':   ['x', 'y'],
+  'hover-at':   ['x', 'y'],
+  'element-at': ['x', 'y'],
+  drag:         ['from', 'to'],
+  'drag-at':    ['x1', 'y1', 'x2', 'y2'],
+  'type-focused': ['text'],
+  'key-down':   ['key'],
+  'key-up':     ['key'],
+  'mouse-down': [],
+  'mouse-up':   [],
+  release:      [],
+  // clipboard paste, wheel calibration, touch, file drop (v2.2)
+  paste:        ['selector', 'text'],
+  'paste-focused': ['text'],
+  'calibrate-wheel': [],
+  tap:          ['selector'],
+  'tap-at':     ['x', 'y'],
+  swipe:        ['x1', 'y1', 'x2', 'y2'],
+  pinch:        ['x', 'y'],
+  'drop-files': ['selector', '...paths'],     // a '...' name collects every remaining token into an array
 };
+
+// Commands whose positionals are ALL numbers. They are validated strictly and
+// never joined: `click-at 10 20 junk` is an error, not "y = '20 junk'".
+const NUMERIC = new Set(['click-at', 'hover-at', 'element-at', 'drag-at', 'tap-at', 'swipe', 'pinch']);
+const NUM_RE = /^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i;
+
+class UsageError extends Error {
+  constructor(msg) { super(msg); this.usage = true; }
+}
 
 // Parses `--key=value` and `--flag` into an object; rest are positional.
 function parseTokens(tokens) {
@@ -72,6 +102,29 @@ function parseTokens(tokens) {
 function buildCommand(cmd, rest, flags) {
   const args = { ...flags };
   const positional = POSITIONAL[cmd] || [];
+
+  if (NUMERIC.has(cmd)) {
+    const want = positional.map((n) => '<' + n + '>').join(' ');
+    if (rest.length !== positional.length) {
+      throw new UsageError(`${cmd} expects exactly ${positional.length} numbers (${want}), got ${rest.length}` +
+        (rest.length > positional.length ? ` - unexpected extra argument(s): ${rest.slice(positional.length).join(' ')}` : ''));
+    }
+    positional.forEach((name, i) => {
+      if (!NUM_RE.test(rest[i])) throw new UsageError(`${cmd}: <${name}> must be a number, got '${rest[i]}'`);
+      args[name] = Number(rest[i]);
+    });
+    return { cmd, args };
+  }
+
+  const last = positional[positional.length - 1];
+  if (last && last.startsWith('...')) {
+    // variadic tail: drop-files <selector> <path> [<path>...]
+    const fixed = positional.slice(0, -1);
+    fixed.forEach((name, i) => { if (i < rest.length) args[name] = rest[i]; });
+    args[last.slice(3)] = rest.slice(fixed.length);
+    return { cmd, args };
+  }
+
   for (let i = 0; i < positional.length && i < rest.length; i++) {
     args[positional[i]] = rest[i];
   }
@@ -143,7 +196,15 @@ async function ensureDaemonReachable() {
 
 async function runOneShot(cmd, rawArgs) {
   const { args: flags, rest } = parseTokens(rawArgs);
-  const { cmd: outCmd, args } = buildCommand(cmd, rest, flags);
+  let built;
+  try { built = buildCommand(cmd, rest, flags); }
+  catch (e) {
+    if (!e.usage) throw e;
+    // same output contract as a daemon-side failure: JSON on stdout, exit code 1
+    process.stdout.write(JSON.stringify({ ok: false, error: e.message }, null, 2) + '\n');
+    process.exit(1);
+  }
+  const { cmd: outCmd, args } = built;
   applyDefaultPage(args);
   const lock = await ensureDaemonReachable();
   const { status, body } = await post(lock.port, '/cmd', { cmd: outCmd, args, cwd: process.cwd() });
@@ -174,7 +235,14 @@ async function runRepl() {
       prompt(); rl.prompt(); return;
     }
     const { args: flags, rest } = parseTokens(tokens);
-    const { cmd: outCmd, args } = buildCommand(cmd, rest, flags);
+    let built;
+    try { built = buildCommand(cmd, rest, flags); }
+    catch (e) {
+      if (!e.usage) throw e;
+      process.stdout.write(JSON.stringify({ ok: false, error: e.message }, null, 2) + '\n');
+      rl.prompt(); return;
+    }
+    const { cmd: outCmd, args } = built;
     if ((args.page == null || args.page === '') && usePage) args.page = usePage;
     try {
       const { body } = await post(lock.port, '/cmd', { cmd: outCmd, args, cwd: process.cwd() });
@@ -264,6 +332,7 @@ async function runStatus(flags) {
         ...base,
         pageCount: st ? st.pageCount : null,
         pages: st ? st.pages.map((p) => ({ page: p.page, label: p.label, url: p.url })) : null,
+        wheelModel: st ? st.wheelModel : null,
       }, null, 2) + '\n');
     }
   } catch (e) {

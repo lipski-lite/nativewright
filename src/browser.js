@@ -102,19 +102,46 @@ COMMON ONE-SHOT COMMANDS (all take --page=<id>)
   goto <url>                       navigate (with human-behavior post-load idle)
   text [selector]                  inner text of element (or page body)
   click <selector>                 human mouse path + jitter + timing
-  dblclick <selector>              double-click
+                                   [--at=x,y] [--hold=ms] [--modifiers=Control,Shift] [--button=] [--clickCount=]
+  dblclick <selector>              double-click (a real detail:2 + dblclick event)
   rightclick <selector>            right-click (context menu)
   fill <selector> <value>          human field-clear + typing with real cadence
-  type <selector> <text>           human keystroke cadence with per-key dwell
-  press <key>                      e.g. Enter, Control+A, ArrowDown
-  hover <selector>                 human mouse path to element
-  scroll <dir|px>                  real wheel ticks with edge-detection
+  type <selector> <text>           human keystroke cadence with per-key dwell   [--typos=on|off|auto]
+  press <key>                      Enter, a, Control+A, Control+Shift+ArrowLeft   [--hold=ms] [--repeat=n]
+  hover <selector>                 human mouse path to element   [--at=x,y]
+  select <selector> <value>        native <select>: real click + arrow keys + Enter (multiple: click / Ctrl-click)
+  scroll <dir|px>                  up|down|left|right|top|bottom|<px> [--dx=px] [--target=sel | --x= --y=]
+                                   quantised wheel on the scroll CONTAINER under the pointer (inner panels too)
   eval <js>                        evaluate an expression in the page
   eval-file <path>                 evaluate a whole JS file in the page (one evaluate)
   shot [name]                      screenshot → ./artifacts/ of the CALLER's cwd
-  save-artifact [name]             screenshot + html + metadata bundle
+                                   [--scale=device|css] [--selector=sel] [--fullPage]; returns dpr, imageSize, clip
+  save-artifact [name]             screenshot + html + metadata bundle (metadata has the real viewport + dpr)
   state                            daemon snapshot (pages, idle timer, recent commands)
   help                             list all commands
+
+COORDINATES, DRAG, KEYS (see README "Coordinates, drag and keys")
+  --space=css|screenshot           css (default) = clientX/clientY; screenshot = device px of a \`shot\` image (css = px / dpr)
+  element-at <x> <y>               read-only hit test: tag, id, text, box, cursor, draggable, editable, selectorHint, iframe chain
+  click-at <x> <y>                 click a viewport point  [--button= --clickCount= --hold=ms --modifiers= --exact]
+  hover-at <x> <y>                 move the pointer to a viewport point
+  drag <from> <to>                 drag between elements  [--from-at=x,y --to-at=x,y --button= --modifiers=]
+  drag-at <x1> <y1> <x2> <y2>      drag between viewport points
+                                   (HTML5 drag-and-drop vs pointer drags are routed automatically)
+  mouse-down|mouse-up [--button=]  press / release at the pointer; the hold persists across commands
+  key-down <key> | key-up <key>    hold / release a key (Shift, Control, Alt, Meta, Enter, ArrowDown, a, ...)
+  release                          release every mouse button and key this page holds
+  type-focused <text>              human typing into whatever is focused (no click)
+  paste <selector> <text>          REAL clipboard paste (human Ctrl+V; OS clipboard restored)   [--from-file=path]
+  paste-focused <text>             same, into the focused field
+  drop-files <selector> <path>...  drop OS files onto an element as if dragged from the file manager   [--at=x,y]
+  calibrate-wheel [--seconds=10]   record YOUR mouse wheel (human in the loop) so scrolling matches your device
+                                   (only a human calibration is adopted; state/status report wheelModel default|human)
+  tap <selector> | tap-at <x> <y> | swipe <x1> <y1> <x2> <y2> | pinch <x> <y> --scale=f
+                                   touch gestures; REFUSED unless the daemon runs with NATIVEWRIGHT_TOUCH=1.
+                                   That daemon is touch-only: click/hover/drag/scroll/fill/type/select/paste <selector>
+                                   (all mouse input, --raw too) are refused there; use tap + type-focused, swipe, drop-files
+  pages / state                    list input.pointer and input.held (buttons, keys) per page
 
 HUMAN-BEHAVIOR LAYER
   All interaction commands use realistic human-like timing and trajectories
@@ -140,6 +167,9 @@ ENVIRONMENT
   NATIVEWRIGHT_CHANNEL          'chrome' (default) | 'chromium' | 'msedge' | 'chrome-beta'
   NATIVEWRIGHT_HEADLESS         set to 1 to run without a visible window (CI only)
   NATIVEWRIGHT_NO_EXEC_PATH     set to 1 to skip the local Chrome probe (lets Patchright resolve)
+  NATIVEWRIGHT_TOUCH            set to 1 for a touch-capable (touch-only, tablet-like) browser: enables tap / swipe / pinch and
+                                refuses mouse commands
+  NATIVEWRIGHT_LAYOUT_SWITCH    alt+shift (default) | ctrl+shift: the shortcut used when typing switches EN <-> RU
   NATIVEWRIGHT_ALLOW_NO_SANDBOX set to 1 to keep --no-sandbox (needed on root Linux / Docker; default: stripped)
   (each is also accepted with the legacy PATCHRIGHT_ prefix)
 
