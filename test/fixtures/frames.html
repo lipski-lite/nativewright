@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nw-frames</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 14px system-ui, sans-serif; }
+  iframe { position: absolute; top: 60px; width: 260px; height: 160px; background: #fff; }
+  #same  { left: 20px;  border: 3px solid #444; padding: 7px; }
+  #cross { left: 360px; border: 2px solid #844; }
+</style>
+<iframe id="same"  src="/inner.html"></iframe>
+<iframe id="cross" src="{{ORIGIN_B}}/inner.html"></iframe>
+<div id="log" hidden></div>
+<script>
+  window.rec = (...a) => { const i = document.createElement('i'); i.textContent = JSON.stringify(a); document.getElementById('log').appendChild(i); };
+  window.addEventListener('message', (e) => { if (e.data && e.data.type === 'inner-click') rec('msg', e.data.origin, e.data.x, e.data.y, e.data.trusted); });
+</script>

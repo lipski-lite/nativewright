@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nw-drop</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 14px system-ui, sans-serif; }
+  #zone { position: absolute; left: 250px; top: 150px; width: 300px; height: 150px; background: #fc9; }
+  #fi   { position: absolute; left: 40px;  top: 40px; }
+</style>
+<div id="zone">drop files here</div>
+<input id="fi" type="file" multiple>
+<div id="log" hidden></div>
+<script>
+  window.rec = (...a) => { const i = document.createElement('i'); i.textContent = JSON.stringify(a); document.getElementById('log').appendChild(i); };
+  const zone = document.getElementById('zone');
+  let over = 0;
+  // what the drag offers: a file manager offers copy|link|move = 'all'. The page answers with dropEffect 'move' (a site may): that
+  // only works when 'move' is among the allowed operations; with effectAllowed 'copy' the browser resets it and sends no drop at all.
+  zone.addEventListener('dragenter', (e) => { e.preventDefault(); rec('dragenter', e.isTrusted, Array.from(e.dataTransfer.types).join('|'), e.dataTransfer.effectAllowed); });
+  zone.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; over++; document.documentElement.dataset.over = over; });
+  zone.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files);
+    const trusted = e.isTrusted;
+    const allowed = e.dataTransfer.effectAllowed, effect = e.dataTransfer.dropEffect;
+    const info = [];
+    for (const f of files) info.push({ name: f.name, size: f.size, type: f.type, text: await f.text() });
+    rec('drop', trusted, over, info, allowed, effect);
+  });
+  document.getElementById('fi').addEventListener('change', (e) => rec('fi-change', Array.from(e.target.files).map((f) => f.name)));
+</script>

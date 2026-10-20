@@ -244,21 +244,55 @@ async function deleteLockfile() {
   }
 }
 
+/** Is this script part of an INSTALLED package: a `node_modules` segment in its real path? (A checkout and `npm link` are not.) */
+function isInstalledScript(scriptPath) {
+  let real;
+  try { real = fs.realpathSync(scriptPath); } catch { real = path.resolve(String(scriptPath)); }
+  return real.split(/[\\/]+/).includes('node_modules');
+}
+
+/** The install pointer as stored, or null when it is missing, unreadable or not an object. */
+async function readInstallFile(file = INSTALL_FILE) {
+  try {
+    const o = JSON.parse(await fsp.readFile(file, 'utf8'));
+    return o && typeof o === 'object' ? o : null;
+  } catch { return null; }
+}
+
 /**
- * Persist the daemon's absolute script path so downstream tools
- * (Claude Code skills, etc.) can locate the entry point portably.
+ * Persist the daemon's absolute script path so downstream tools (Claude Code skills, other agents) can find the entry
+ * point when `nativewright` is not on their PATH. The pointer belongs to the INSTALLED package, so it is written only when
+ *   (a) there is no (readable) pointer, or
+ *   (b) the existing pointer's scriptPath no longer exists on disk, or
+ *   (c) the running script is an installed package (its real path has a `node_modules` segment).
+ * A start from anywhere else - a git checkout, `npm link` included - never replaces a valid pointer to another path (once, a
+ * single start from a clone redirected another tool to unreleased working-tree code on the user's real profile); it may
+ * create one when none exists. One log line says when it declines.
+ * `file` and `log` are for tests (the default is <data root>/install.json and the daemon log).
  * @param {string} scriptPath
- * @returns {Promise<void>}
+ * @returns {Promise<{written: boolean, reason: string, kept?: string}>}
  */
-async function writeInstallFile(scriptPath) {
-  ensureDir(ROOT_DIR);
+async function writeInstallFile(scriptPath, { file = INSTALL_FILE, log = appendLog } = {}) {
+  const existing = await readInstallFile(file);
+  const current = existing && typeof existing.scriptPath === 'string' && existing.scriptPath ? existing.scriptPath : null;
+  let reason = null;
+  if (!current) reason = 'no pointer yet';
+  else if (!fs.existsSync(current)) reason = 'the existing pointer is dangling';
+  else if (isInstalledScript(scriptPath)) reason = 'installed package';
+  if (!reason) {
+    if (path.resolve(current) === path.resolve(scriptPath)) return { written: false, kept: current, reason: 'already points here' };
+    log(`install pointer kept: ${current} (this start, ${scriptPath}, is not an installed package)`);
+    return { written: false, kept: current, reason: 'valid pointer to another path' };
+  }
+  ensureDir(path.dirname(file));
   const obj = {
     scriptPath,
     installedAt: new Date().toISOString(),
     node: process.version,
     platform: process.platform,
   };
-  await fsp.writeFile(INSTALL_FILE, JSON.stringify(obj, null, 2));
+  await fsp.writeFile(file, JSON.stringify(obj, null, 2));
+  return { written: true, reason };
 }
 
 // ---------- liveness check ------------------------------------------------
@@ -341,7 +375,7 @@ module.exports = {
   PROFILE, BASE_HOME,
   ROOT_DIR, LOCK_FILE, INSTALL_FILE, LOG_DIR, LOG_FILE, DEFAULT_PROFILE, IDLE_EXIT_MS,
   envAny, nativewrightHome, userDataDir, artifactsDir, chromeExecutable, ensureDir,
-  readLockfile, writeLockfile, deleteLockfile, writeInstallFile,
+  readLockfile, writeLockfile, deleteLockfile, writeInstallFile, readInstallFile, isInstalledScript,
   pidAlive, httpPing, verifyLockfile,
   makeArtifactName, appendLog,
 };

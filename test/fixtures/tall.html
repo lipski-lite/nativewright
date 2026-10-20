@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nw-tall</title>
+<style>
+  html, body { margin: 0; font: 14px system-ui, sans-serif; }
+  #tall { height: 8000px; background: linear-gradient(#ffffff, #8899aa); }
+  #far  { position: absolute; left: 80px; top: 3000px; width: 160px; height: 50px; }
+</style>
+<div id="tall">tall document</div>
+<button id="far">far button</button>
+<div id="log" hidden></div>
+<script>
+  window.rec = (...a) => { const i = document.createElement('i'); i.textContent = JSON.stringify(a); document.getElementById('log').appendChild(i); };
+  document.getElementById('far').addEventListener('click', (e) => rec('far-click', Math.round(e.clientY), Math.round(scrollY), e.isTrusted));
+  let w = 0;
+  document.addEventListener('wheel', (e) => {
+    w++; document.documentElement.dataset.wheels = w;
+    rec('w', e.deltaX, e.deltaY, e.deltaMode, e.isTrusted, Math.round(e.timeStamp * 10) / 10);
+  }, { capture: true, passive: true });
+  // touch (the touch-only profile scrolls with finger drags, never with a wheel)
+  const r2 = (n) => Math.round(n * 10) / 10;
+  for (const t of ['touchstart', 'touchend', 'touchcancel']) {
+    document.addEventListener(t, (e) => rec('t', t, e.touches.length, e.changedTouches.length ? r2(e.changedTouches[0].clientX) : 0, e.changedTouches.length ? r2(e.changedTouches[0].clientY) : 0, e.isTrusted), { capture: true, passive: true });
+  }
+  let tm = 0; document.addEventListener('touchmove', () => { tm++; document.documentElement.dataset.touchmoves = tm; }, { capture: true, passive: true });
+</script>

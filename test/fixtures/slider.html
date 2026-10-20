@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nw-slider</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 14px system-ui, sans-serif; user-select: none; }
+  #track { position: absolute; left: 40px; top: 60px; width: 400px; height: 24px; background: #ccd; border-radius: 12px; touch-action: none; }
+  #thumb { position: absolute; left: 0; top: 0; width: 24px; height: 24px; background: #36c; border-radius: 12px; touch-action: none; }
+  #range { position: absolute; left: 40px; top: 130px; width: 400px; }
+  #pad   { position: absolute; left: 40px; top: 190px; width: 400px; height: 200px; background: #efe; touch-action: none; }
+</style>
+<div id="track"><div id="thumb"></div></div>
+<input id="range" type="range" min="0" max="100" value="0">
+<div id="pad"></div>
+<div id="log" hidden></div>
+<script>
+  window.rec = (...a) => { const i = document.createElement('i'); i.textContent = JSON.stringify(a); document.getElementById('log').appendChild(i); };
+  const track = document.getElementById('track'), thumb = document.getElementById('thumb');
+  const root = document.documentElement;
+  root.dataset.value = '0';
+  let dragging = false;
+  function setFrom(clientX) {
+    const r = track.getBoundingClientRect();
+    const v = Math.max(0, Math.min(100, Math.round(((clientX - r.left - 12) / (r.width - 24)) * 100)));
+    thumb.style.left = (v / 100) * (r.width - 24) + 'px';
+    root.dataset.value = String(v);
+    return v;
+  }
+  thumb.addEventListener('pointerdown', (e) => { dragging = true; thumb.setPointerCapture(e.pointerId); rec('down', e.buttons, Math.round(e.clientX)); });
+  thumb.addEventListener('pointermove', (e) => {
+    // only while the button is down: a stray hover (e.g. the human's real mouse crossing a headed window) must not move the thumb
+    if (!dragging || !(e.buttons & 1)) return;
+    setFrom(e.clientX);
+    root.dataset.moves = String((+root.dataset.moves || 0) + 1);
+    root.dataset.lastButtons = String(e.buttons);
+    root.dataset.maxCoalesced = String(Math.max(+root.dataset.maxCoalesced || 0, e.getCoalescedEvents().length));
+  });
+  thumb.addEventListener('pointerup', (e) => { dragging = false; rec('up', e.buttons, root.dataset.value); });
+  // pad: counts pointermoves that carry a pressed button
+  const pad = document.getElementById('pad');
+  pad.addEventListener('pointermove', (e) => { if (e.buttons & 1) root.dataset.padMoves = String((+root.dataset.padMoves || 0) + 1); });
+  pad.addEventListener('pointerdown', (e) => rec('pad-down', e.buttons, Math.round(e.clientX), Math.round(e.clientY)));
+  pad.addEventListener('pointerup', (e) => rec('pad-up', e.buttons, Math.round(e.clientX), Math.round(e.clientY)));
+</script>

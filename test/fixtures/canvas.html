@@ -1,0 +1,54 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nw-canvas</title>
+<style>
+  /* compact: fits the smallest viewport (headless 758x482) */
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; font: 14px system-ui, sans-serif; }
+  #txt   { position: absolute; left: 20px;  top: 20px;  width: 300px; }
+  #cv    { position: absolute; left: 20px;  top: 80px;  width: 400px; height: 280px; background: #e8f0ff; outline: 1px solid #88a; touch-action: none; }
+  #btn   { position: absolute; left: 450px; top: 90px;  width: 130px; height: 44px; }
+  #small { position: absolute; left: 450px; top: 160px; width: 16px;  height: 16px; background: #c33; }
+  #link  { position: absolute; left: 450px; top: 200px; }
+  #mark  { position: absolute; left: 450px; top: 250px; width: 80px; height: 60px; background: #ddd; cursor: pointer; }
+</style>
+<input id="txt" aria-label="text box">
+<div id="cv"></div>
+<button id="btn">Button</button>
+<div id="small"></div>
+<a id="link" href="#x" class="nav primary">a link</a>
+<div id="mark" role="note" title="the mark">mark</div>
+<ul style="position:absolute;left:450px;top:330px;margin:0;padding-left:18px"><li>one</li><li class="it">two</li><li>three</li></ul>
+<div id="log" hidden></div>
+<script>
+  // events are recorded into the DOM (the product's evaluate runs in an isolated world: it reads the DOM, not window globals)
+  window.rec = (...a) => { const i = document.createElement('i'); i.textContent = JSON.stringify(a); document.getElementById('log').appendChild(i); };
+  const r2 = (n) => Math.round(n * 100) / 100;
+  for (const t of ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu']) {
+    document.addEventListener(t, (e) => rec('m', t, r2(e.clientX), r2(e.clientY), e.button, e.buttons, e.detail, e.isTrusted, e.shiftKey, e.ctrlKey, e.altKey, e.target.id || e.target.tagName, Math.round(e.timeStamp)), true);
+  }
+  for (const t of ['keydown', 'keyup']) {
+    document.addEventListener(t, (e) => rec('k', t, e.key, e.code, e.keyCode, e.repeat, e.shiftKey, e.ctrlKey, e.altKey, e.metaKey, e.location, Math.round(e.timeStamp * 10) / 10, e.isTrusted), true);
+  }
+  document.addEventListener('wheel', (e) => rec('w', e.deltaX, e.deltaY, e.deltaMode, e.isTrusted), { capture: true, passive: true });
+  // pointermove statistics on the canvas (one summary node, not one node per event)
+  const cv = document.getElementById('cv');
+  const stats = { n: 0, withButtons: 0, shiftMoves: 0, maxCoalesced: 0, multi: 0, buttonsSeen: [], pressures: [], pointerTypes: [] };
+  const sn = document.createElement('div'); sn.id = 'stats'; sn.hidden = true; document.body.appendChild(sn);
+  function flush() { sn.textContent = JSON.stringify(stats); }
+  cv.addEventListener('pointermove', (e) => {
+    const c = e.getCoalescedEvents().length;
+    stats.n++; if (e.buttons) stats.withButtons++; if (e.buttons && e.shiftKey) stats.shiftMoves++;
+    stats.maxCoalesced = Math.max(stats.maxCoalesced, c); if (c > 1) stats.multi++;
+    if (!stats.buttonsSeen.includes(e.buttons)) stats.buttonsSeen.push(e.buttons);
+    if (!stats.pressures.includes(e.pressure)) stats.pressures.push(e.pressure);
+    if (!stats.pointerTypes.includes(e.pointerType)) stats.pointerTypes.push(e.pointerType);
+    flush();
+  });
+  cv.addEventListener('pointerdown', (e) => rec('pd', e.pointerType, e.buttons, r2(e.clientX), r2(e.clientY), e.isTrusted));
+  flush();
+  // touch
+  for (const t of ['touchstart', 'touchend', 'touchcancel']) {
+    document.addEventListener(t, (e) => rec('t', t, e.touches.length, e.changedTouches.length ? r2(e.changedTouches[0].clientX) : 0, e.changedTouches.length ? r2(e.changedTouches[0].clientY) : 0, e.isTrusted), { capture: true, passive: true });
+  }
+  let tm = 0; document.addEventListener('touchmove', () => { tm++; document.documentElement.dataset.touchmoves = tm; }, { capture: true, passive: true });
+</script>

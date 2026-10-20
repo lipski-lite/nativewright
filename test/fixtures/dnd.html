@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nw-dnd</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; font: 14px system-ui, sans-serif; }
+  #src { position: absolute; left: 40px;  top: 60px;  width: 120px; height: 60px; background: #9cf; }
+  #dst { position: absolute; left: 400px; top: 60px;  width: 220px; height: 130px; background: #fc9; }
+  #pic { position: absolute; left: 40px;  top: 200px; width: 80px;  height: 80px; }
+  #nodrag { position: absolute; left: 200px; top: 220px; width: 100px; height: 50px; background: #ddd; }
+</style>
+<div id="src" draggable="true">drag me</div>
+<div id="dst">drop here</div>
+<img id="pic" alt="pic" src="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='80'%3E%3Crect width='80' height='80' fill='%23393'/%3E%3C/svg%3E">
+<div id="nodrag">not draggable</div>
+<div id="log" hidden></div>
+<script>
+  window.rec = (...a) => { const i = document.createElement('i'); i.textContent = JSON.stringify(a); document.getElementById('log').appendChild(i); };
+  const src = document.getElementById('src'), dst = document.getElementById('dst');
+  let over = 0;
+  src.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', 'payload-123'); e.dataTransfer.effectAllowed = 'copyMove'; rec('dragstart', e.isTrusted); });
+  src.addEventListener('dragend', (e) => rec('dragend', e.isTrusted, e.dataTransfer.dropEffect));
+  dst.addEventListener('dragenter', (e) => { e.preventDefault(); rec('dragenter', e.isTrusted); });
+  dst.addEventListener('dragover', (e) => { e.preventDefault(); over++; document.documentElement.dataset.over = over; });
+  dst.addEventListener('dragleave', (e) => rec('dragleave', e.isTrusted));
+  dst.addEventListener('drop', (e) => { e.preventDefault(); rec('drop', e.isTrusted, e.dataTransfer.getData('text/plain'), over); });
+</script>

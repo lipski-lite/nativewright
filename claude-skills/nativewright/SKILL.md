@@ -147,6 +147,21 @@ Every interaction command (`click`, `dblclick`, `rightclick`, `fill`, `type`, `p
 - Typo simulation (~0.8% per char) is **auto-disabled for password/OTP/CVV/PIN/secret/token fields**.
 - Scroll uses real wheel events and stops when the page can't scroll further.
 
+## Coordinates, drag, holds and keys (nativewright ≥ 2.2.0)
+
+Prefer **selectors**. Use **coordinates** only when there is no selector (canvas, game, map, widget in a cross-origin iframe, a point read off a screenshot).
+
+- **The DPR trap.** `--space=css` (default) = CSS px, what `clientX/Y` report. `--space=screenshot` = device px read off a `shot` image; the daemon divides by `devicePixelRatio`. On a 150% display a point read off a screenshot is 1.5× its CSS position, so `click-at` with the raw numbers lands in the wrong place (or is rejected: errors state the viewport, dpr and converted css values). Workflow: `shot` → read `dpr`/`viewport`/`imageSize` from the response → `click-at <px> <py> --space=screenshot`. For an offset inside an element, measure on `shot --selector=…` and use `--at=x,y --space=screenshot`.
+- `element-at <x> <y>` tells you what is at a point (tag, id, text, box, `draggable`, `editable`, `selectorHint`, iframe chain) without dispatching input — use it before you click blind.
+- **Drag**: `drag <from> <to>` (`--from-at/--to-at`) or `drag-at x1 y1 x2 y2`. HTML5 drag-and-drop vs pointer drags (sliders, canvases) is chosen automatically from the start point (`mode` in the response). Check the effect afterwards; a drop that the page ignored is not an error.
+- **Holds persist across commands**: `key-down Shift`, `mouse-down`, … stay down until `key-up`/`mouse-up`/`release`. `pages`/`state` show `input.held`. **Always `release` (or pair every down with an up) before you finish** — the daemon releases a page's holds when you `close` it, but a forgotten Shift changes every click in between.
+- `press` takes combos: `press Control+A`, `press Control+Shift+ArrowLeft`, `--hold=<ms>` (past ~500 ms it auto-repeats; a held printable key keeps typing, like hardware), `--repeat=<n>`. `type-focused <text>` types into whatever has focus without clicking. `--typos=on|off|auto` (default auto, off for password fields) works on `type`, `fill`, `type-focused`.
+- **Scrolling**: `scroll down|up|left|right|top|bottom|<px>`, `--dx=<px>`, and **`--target=<selector>` (or `--x --y`) to put the pointer over the panel you mean** — the wheel acts on the scroll container under the pointer, which in most apps is an inner panel, not the page. The wheel is quantised to notches (default 100 px): the response's `scrolledBy` is what actually moved. `calibrate-wheel` (ask the human, 10 s) fits it to their device; only a HUMAN calibration is adopted (`wheelModel` in `state`/`status`/`scroll` says `default` or `human`).
+- **Text with Cyrillic / emoji works as typed text**: the engine switches the keyboard layout like a person (Alt+Shift) and commits emoji like an IME; nothing to do on your side. `paste <selector> <text>` / `paste-focused <text>` do a REAL clipboard paste (and restore the human's clipboard; they type instead when the clipboard holds non-text data, in headless, or when anything is unsafe — look at `method` and `reason`; if `clipboardRestored` is `false`, read `restoreNote`). On Windows the payload is flagged out of clipboard history and cloud sync, but other tools can still see it: **never paste a secret**, use `fill --raw=true`. The typed fallback is for short texts: over 2000 characters it is refused (the error says why and how long typing would take) — paste into a headed daemon with a plain-text clipboard, or use `fill --raw=true`, for bulk text.
+- `select <selector> <value>` drives a native `<select>` by value or label (multiple: JSON array).
+- `drop-files <selector> <path>…` drops local files onto an upload zone like a drag from Explorer.
+- **Touch is gated, and it is a different device.** `tap`, `tap-at`, `swipe`, `pinch` are refused unless the daemon was started with `NATIVEWRIGHT_TOUCH=1` (use a separate `--profile`). That daemon is a touch-ONLY tablet-class browser (`any-pointer: fine` false), so the reverse also holds: **every mouse command is refused there, `--raw` included** — `click`, `hover`, `click-at`, `hover-at`, `drag`, `drag-at`, `mouse-down/up`, `scroll`, and `fill` / `type` / `select` / `paste <selector>` (they click the field). Workflow on a touch daemon: `tap` the field, then `type-focused` / `paste-focused` / `press`; `swipe` to scroll; `drop-files` for uploads. Do not work around either refusal.
+
 ## Command reference
 
 All page commands accept `--page=<id>` (required when >1 page is open), `--timeout=<ms>` (default 30000) and `--key=value` flags for any non-positional option. Interaction commands additionally accept `--raw=true` and `--seed=<int>`.
@@ -163,10 +178,19 @@ All page commands accept `--page=<id>` (required when >1 page is open), `--timeo
 |  | `rightclick <selector>` | selector | right-button click |
 |  | `fill <selector> <value>` | selector, value | select-all + clear + typed at human cadence |
 |  | `type <selector> <text>` | selector, text | human keystroke cadence; `--typos=on\|off\|auto` |
-|  | `press <key>` | key | e.g. `Enter`, `Control+A`, `ArrowDown` |
-|  | `hover <selector>` | selector | human mouse path to element |
-|  | `select <selector> <value>` | selector, value | `<select>` option |
-|  | `scroll <top\|bottom\|up\|down\|<px>>` | direction | real wheel ticks with edge-detection |
+|  | `press <key>` | key | `Enter`, `Control+A`, `Control+Shift+ArrowLeft`; `--hold=<ms>`, `--repeat=<n>` |
+|  | `hover <selector>` | selector | human mouse path to element; `--at=x,y` |
+|  | `click-at <x> <y>` | x, y | viewport point; `--space=css\|screenshot`, `--button`, `--clickCount`, `--hold`, `--modifiers`, `--exact` |
+|  | `hover-at <x> <y>` / `element-at <x> <y>` | x, y | move the pointer / read-only hit test |
+|  | `drag <from> <to>` / `drag-at <x1> <y1> <x2> <y2>` | selectors / points | HTML5 vs pointer drag chosen automatically; `--from-at`, `--to-at`, `--button`, `--modifiers` |
+|  | `mouse-down` / `mouse-up` / `key-down <key>` / `key-up <key>` / `release` | — | holds persist across commands; `release` lets go of everything |
+|  | `type-focused <text>` | text | human typing into the focused element |
+|  | `paste <selector> <text>` / `paste-focused <text>` | text | real clipboard paste; `--from-file=<path>` |
+|  | `drop-files <selector> <path>…` | selector, paths | drop local files on a drop zone; `--at=x,y` |
+|  | `tap` / `tap-at` / `swipe` / `pinch` | — | touch; refused unless `NATIVEWRIGHT_TOUCH=1` (and on that touch-only daemon mouse commands are refused) |
+|  | `select <selector> <value>` | selector, value | native `<select>` (click + arrow keys + Enter; multiple: JSON array) |
+|  | `scroll <up\|down\|left\|right\|top\|bottom\|<px>>` | direction | quantised wheel on the scroll container under the pointer; `--dx`, `--target`, `--x --y` |
+|  | `calibrate-wheel` | — | record the human's own wheel (ask them first; `--seconds=10`); only on a blank or local page: `new --label=calibrate` (starts on `about:blank`), then `calibrate-wheel --page=<id>` — a real website is refused (its scripts could see the overlay) |
 |  | `upload <selector> <path>` | selector, path | file input; absolute or relative to YOUR cwd |
 | Wait | `wait <ms>` | ms | blind sleep (prefer wait-for) |
 |  | `wait-for <selector>` | selector | `--state=visible\|hidden\|attached\|detached` |
@@ -181,7 +205,7 @@ All page commands accept `--page=<id>` (required when >1 page is open), `--timeo
 | Frames | `frame <name>` | name | subsequent commands on THIS page target this frame |
 |  | `frame --reset` | — | clear frame scope for this page |
 | Dialogs | `dialog <accept\|dismiss> [prompt]` | action, promptText? | policy for this page's alert/confirm/prompt |
-| Artifacts | `shot [name]` | name? | PNG under `./artifacts/` of your cwd |
+| Artifacts | `shot [name]` | name? | PNG under `./artifacts/` of your cwd; `--scale=device\|css`, `--selector=<sel>`; returns `dpr`, `viewport`, `imageSize`, `clip` |
 |  | `save-artifact [name]` | name? | PNG + HTML + metadata JSON bundle |
 |  | `downloads [--n=N]` | — | this page's captured downloads |
 | Diagnostics | `network-log [--n=N]` | — | this page's recent requests/responses |
@@ -241,6 +265,12 @@ If the target site requires login and your profile has none yet, delegate to the
 | Selector timeout | element hasn't rendered | prefer `wait-for <selector>` over blind `wait <ms>` |
 | `profile lock` error on start | a Chrome already uses the profile | close that Chrome; check processes |
 | `viewport` rejected | guardrail | pass `--force=true` and understand you're overriding real geometry |
+| `unknown command: click-at` (or `paste`, `drag`, `key-down`, `element-at`, `drop-files`, …) | the installed nativewright is older than 2.2.0 | stop and ask the human to `npm install -g nativewright@latest`; do not emulate the command with `eval` |
+| `click-at` lands in the wrong place / "outside the viewport" | screenshot pixels used as CSS px (dpr ≠ 1) | add `--space=screenshot`, or divide by `dpr` from `shot` |
+| every click behaves as if Shift/Ctrl were down | a `key-down` hold was never released | `pages` → `input.held`; run `release` |
+| `scroll` moves nothing visible | the pointer is over a non-scrolling area / the page scrolls in an inner panel | `scroll … --target=<the panel>`; read `container` in the response |
+| `touch refused` | the browser reports no touch support | do not force it; start a separate `NATIVEWRIGHT_TOUCH=1` daemon only if touch input is really needed |
+| `mouse input refused` | you are on a touch-only (`NATIVEWRIGHT_TOUCH=1`) daemon: it has no mouse | `tap` the element, then `type-focused` / `paste-focused` / `press`; `swipe` instead of `scroll`; or use a normal daemon for mouse work |
 
 ## Routing other skills through this one
 

@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>nw-inner</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #fff7e0; font: 13px system-ui, sans-serif; }
+  #ib { position: absolute; left: 30px; top: 30px; width: 120px; height: 40px; }
+</style>
+<button id="ib" class="inner-btn">inner</button>
+<script>
+  document.getElementById('ib').addEventListener('click', (e) => {
+    // the parent cannot read a cross-origin frame's DOM: report through postMessage
+    parent.postMessage({ type: 'inner-click', origin: location.origin, x: Math.round(e.clientX), y: Math.round(e.clientY), trusted: e.isTrusted }, '*');
+  });
+</script>
