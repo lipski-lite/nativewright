@@ -53,6 +53,9 @@ jobs:
       - name: Run tests (smoke + input layer)
         run: npm test
 
+      - name: Run MCP server tests (protocol + integration)
+        run: npm run test:mcp
+
       - name: Run browser-less sanity checks
         run: npm run test:sanity
 

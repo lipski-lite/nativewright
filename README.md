@@ -262,6 +262,27 @@ NativeWright ships two ready-to-use skills in `claude-skills/`:
 
 Copy both directories into `~/.claude/skills/` (user-level) or `<project>/.claude/skills/` (project-level) and they become available to any Claude Code session in that scope.
 
+### MCP server
+
+NativeWright ships a zero-dependency MCP (stdio) server, `nativewright-mcp`, as an alternative to shell-driven CLI calls. It is a thin client to the same daemon: it starts the daemon on demand, holds one page lease per MCP session, and exposes a curated `browser_*` tool set. On exit it closes its page and never stops the daemon.
+
+```bash
+# Claude Code, user scope
+claude mcp add --scope user nativewright -- nativewright-mcp
+```
+
+Any other MCP client can use:
+
+```json
+{ "mcpServers": { "nativewright": { "type": "stdio", "command": "nativewright-mcp" } } }
+```
+
+Tools: `browser_navigate`, `browser_navigate_back`, `browser_reload`, `browser_click`, `browser_type`, `browser_fill_form`, `browser_press_key`, `browser_hover`, `browser_select_option`, `browser_drag`, `browser_scroll`, `browser_evaluate`, `browser_read`, `browser_element_at`, `browser_take_screenshot`, `browser_save_artifact`, `browser_downloads`, `browser_console_messages`, `browser_network_requests`, `browser_state`, `browser_tabs`, `browser_wait_for`, `browser_handle_dialog`, `browser_file_upload`, `browser_resize`, `browser_close`. Selectors are Playwright locator strings (CSS, `text=`, `role=`, `xpath=`); there are no ARIA snapshot refs. Every page tool accepts an optional `page` id and otherwise uses the session page; `browser_tabs` lists, opens, closes, and selects pages. Screenshots are returned as image content unless images are disabled.
+
+Options (also readable from `~/.config/nativewright/mcp.json`): `--profile=<name>`, `--workspace=<dir>`, `--label=<name>`, `--timeout=<ms>`, `--no-images`, `--allow-unrestricted-file-access`, `--allow-shared-pages`, `--print-config`. The workspace (default: cwd) confines **upload paths only** — navigation, `browser_evaluate`, and `file://` reads are not restricted, matching the CLI. Pages this MCP session did not open are listed but cannot be selected or closed unless `--allow-shared-pages` is set.
+
+**Coexistence with the Playwright MCP.** Claude Code namespaces tools by server (`mcp__nativewright__*` vs `mcp__playwright__*`), so both may be configured. They use separate Chrome profiles (each under its own configured data directory) and separate artifact directories, and the NativeWright daemon binds an ephemeral loopback port. Prefer one enabled at a time per project: `/mcp disable playwright` or `/mcp disable nativewright` (`/mcp enable` reverses). Do not use `claude mcp remove` to "disable" a server — it deletes the configuration. Never point both servers at the same Chrome user-data directory.
+
 ### Cursor / Codex / Gemini CLI
 
 Install via `npm install -g nativewright` or use `npx`. The three command modes (start / one-shot / repl) map cleanly to any agent's shell-execution tool. See [`docs/agents.md`](docs/agents.md) for agent-specific examples (coming soon).
@@ -507,6 +528,8 @@ src/
 ├── daemon.js         HTTP server, BrowserContext, page registry, event wiring
 ├── commands.js       command handlers (goto / click / shot / …)
 ├── cli.js            HTTP client for one-shot + REPL modes
+├── mcp.js            `nativewright-mcp` entry: MCP (stdio) server
+├── mcp/              MCP modules (protocol, daemon client, tools, handlers, config, paths)
 ├── config.js         env, paths, lockfile I/O, Chrome detection
 ├── human.js          human-behavior primitives (Bézier paths, Fitts timing, per-page input state,
 │                     key emitter, layout-aware typing, container-aware wheel scrolling)
@@ -537,6 +560,7 @@ npx patchright install chromium     # or: install chrome
 # Integration tests: the smoke test + the input-layer suite (real daemon, real Chrome)
 npm test                                  # headed
 NATIVEWRIGHT_HEADLESS=1 npm test          # headless (CI)
+npm run test:mcp                          # MCP protocol + integration suite
 npm run test:sanity                       # browser-less maths / typing-engine checks
 ```
 

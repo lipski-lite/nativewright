@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The **MCP server**: `nativewright-mcp` exposes the same daemon over the Model Context Protocol (stdio), with a curated `browser_*` tool set, on-demand daemon startup, page leases, inline screenshots, and workspace-confined file access. It uses Node built-ins only — no new runtime dependencies.
+
+### Added
+- **`nativewright-mcp` bin and server.** A strict JSON-RPC 2.0 implementation over newline-delimited stdio (`initialize`, `tools/list`, `tools/call`, `ping`, notifications, batches, cancellation) with protocol-version negotiation and stdout reserved for protocol frames.
+- **26 tools:** navigation (`navigate`, `navigate_back`, `reload`), interaction (`click`, `type`, `fill_form`, `press_key`, `hover`, `select_option`, `drag`, `scroll`), reads (`evaluate`, `read`, `element_at`), artifacts (`take_screenshot` with inline PNG content, `save_artifact`, `downloads`), diagnostics (`console_messages`, `network_requests`, `state`), and session tools (`tabs`, `wait_for`, `handle_dialog`, `file_upload`, `resize`, `close`). Selectors are Playwright locator strings; there are no ARIA refs.
+- **Daemon integration.** The server starts the daemon on demand (detached, single-flight), holds one session page lease, recreates a lost page once, and never stops the daemon on exit; the daemon idle-exits as usual.
+- **Workspace-confined file access.** Upload paths are resolved against `--workspace` with realpath containment; `--allow-unrestricted-file-access` opts out.
+- **Configuration.** CLI flags plus `~/.config/nativewright/mcp.json` and `NATIVEWRIGHT_MCP_*` environment variables, with `--print-config` for inspection.
+- **Tests and CI.** `test/mcp.protocol.test.js` (no browser) and `test/mcp.integration.test.js` (real daemon and browser); `npm run test:mcp` runs both and CI runs the suite.
+
+### Changed
+- `package.json` adds the `nativewright-mcp` bin, the `test:mcp` script, and the `mcp` keyword; `package-lock.json` was regenerated.
+- README gained an "MCP server" section covering registration, tools, options, and coexistence with the Playwright MCP.
+
 ## [2.2.0] — 2026-10-20
 
 The **low-level input layer**: coordinates, drag-and-drop, held buttons and keys, a wheel and keyboard that behave like hardware, real clipboard paste, native `<select>`, file drops and (opt-in, gated) touch. Everything is human-by-default and has a `--raw=true` escape hatch; the new commands are all page-targeted (`--page=<id>`).

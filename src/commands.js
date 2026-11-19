@@ -865,11 +865,14 @@ const commands = {
 
   async upload(ctx, args) {
     const sel = requireSelector(args);
-    if (!args.path) throw new Error('path required');
-    const abs = path.resolve(ctx.cwd || process.cwd(), args.path);
-    if (!fs.existsSync(abs)) throw new Error(`file not found: ${abs}`);
+    const raw = Array.isArray(args.paths) ? args.paths : args.path != null ? [args.path] : [];
+    if (raw.length === 0) throw new Error('path required');
+    const abs = raw.map((p) => path.resolve(ctx.cwd || process.cwd(), String(p)));
+    for (const f of abs) if (!fs.existsSync(f)) throw new Error(`file not found: ${f}`);
+    // setInputFiles accepts a string[] and replaces the selection atomically,
+    // so multi-file inputs get all files in one command.
     await ctx.scope.setInputFiles(sel, abs, { timeout: withTimeout(args) });
-    return { selector: sel, file: abs };
+    return { selector: sel, file: abs[0], files: abs };
   },
 
   // Drop OS files onto an element as if dragged in from the file manager.
@@ -958,6 +961,13 @@ const commands = {
   async eval(ctx, args) {
     if (!args.js) throw new Error('js required');
     const { page } = ctx;
+    if (args.selector) {
+      // Selector form: Playwright resolves the element (CSS, text=, role=,
+      // xpath=) and calls the supplied function with it.
+      const fn = new Function('el', `return (${args.js})(el);`);
+      const value = await ctx.scope.locator(String(args.selector)).first().evaluate(fn);
+      return { selector: args.selector, value: value === undefined ? null : value };
+    }
     const wrapped = `(async()=>{ return (${args.js}); })()`;
     let value;
     try {

@@ -6,6 +6,8 @@
     "patchright",
     "playwright",
     "browser",
+    "mcp",
+    "model-context-protocol",
     "automation",
     "browser-automation",
     "agent",
@@ -59,7 +61,8 @@
   "license": "Apache-2.0",
   "main": "src/browser.js",
   "bin": {
-    "nativewright": "src/browser.js"
+    "nativewright": "src/browser.js",
+    "nativewright-mcp": "src/mcp.js"
   },
   "files": [
     "src/",
@@ -74,6 +77,7 @@
     "status": "node src/browser.js status",
     "repl": "node src/browser.js repl",
     "test": "node --test test/smoke.test.js test/input.test.js",
+    "test:mcp": "node --test test/mcp.protocol.test.js test/mcp.integration.test.js",
     "test:sanity": "node src/human.sanity.js",
     "install-chromium": "patchright install chromium",
     "install-chrome": "patchright install chrome"
