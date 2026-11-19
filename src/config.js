@@ -219,8 +219,12 @@ async function readLockfile() {
     const raw = await fsp.readFile(LOCK_FILE, 'utf8');
     return JSON.parse(raw);
   } catch (e) {
-    if (e.code === 'ENOENT') return null;
-    throw e;
+    if (e.code !== 'ENOENT') {
+      // A truncated/corrupt lockfile is stale: report it as absent so the
+      // caller reaps it instead of failing every command with a SyntaxError.
+      appendLog(`ignoring unreadable lockfile: ${e.message}`);
+    }
+    return null;
   }
 }
 

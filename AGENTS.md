@@ -252,7 +252,8 @@ nativewright frame --reset
 
 ## 11. Reference docs in this repo
 
-- `README.md` — full project documentation.
+- `README.md` — full project documentation (including the "MCP server" section).
+- `src/mcp.js` / `src/mcp/` — the `nativewright-mcp` stdio server: protocol, daemon client, tool schemas, handlers.
 - `claude-skills/nativewright/SKILL.md` — the canonical agent protocol (this file mirrors it for Codex).
 - `claude-skills/nativewright-login-bootstrap/SKILL.md` — detailed first-run manual-login procedure.
 - `src/commands.js` — source of truth for the command surface; if this file and the table in §5 ever disagree, the source wins (then update §5).
